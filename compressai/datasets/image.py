@@ -29,7 +29,7 @@
 
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from torch.utils.data import Dataset
 
 from compressai.registry import register_dataset
@@ -75,10 +75,41 @@ class ImageFolder(Dataset):
         Returns:
             img: `PIL.Image.Image` or transformed `PIL.Image.Image`.
         """
-        img = Image.open(self.samples[index]).convert("RGB")
-        if self.transform:
-            return self.transform(img)
-        return img
+        
+        max_attempts = 10  # Safety guard to prevent infinite loops on a fully corrupted dataset
+        attempt = 0
+
+        while attempt < max_attempts:
+            file_path = self.samples[index]
+            try:
+                # Attempt to open and convert the image
+                img = Image.open(file_path).convert("RGB")
+                
+                # Verify the file content (optional but helpful)
+                # This line might also raise UnidentifiedImageError or OSError
+                img.verify()
+                
+                # Reopen after verify (verify closes the file)
+                img = Image.open(file_path).convert("RGB")
+                
+                # If successful, break the loop and proceed
+                if self.transform:
+                    return self.transform(img)
+                return img
+                
+            except (UnidentifiedImageError, OSError) as e:
+                # This catches the error you encountered (and related file reading errors)
+                print(f"⚠️ Corrupt file skipped: {file_path} (Error: {e})")
+                
+                # Move to the next index (circularly)
+                index = (index + 1) % len(self.samples)
+                attempt += 1
+
+        # If the loop finishes without returning (too many consecutive corrupt files)
+        raise RuntimeError(
+            f"Failed to load a valid image after {max_attempts} consecutive attempts. "
+            "Please clean your dataset or increase max_attempts."
+        )
 
     def __len__(self):
         return len(self.samples)
