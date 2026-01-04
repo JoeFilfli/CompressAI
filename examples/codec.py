@@ -57,8 +57,6 @@ from compressai.transforms.functional import (
 )
 from compressai.zoo import image_models, models
 
-from compressai.models import my_model
-
 torch.backends.cudnn.deterministic = True
 
 model_ids = {k: i for i, k in enumerate(models.keys())}
@@ -368,16 +366,8 @@ def _encode(input, num_of_frames, model, metric, quality, coder, device, output)
     enc_start = time.time()
 
     start = time.time()
-    if model == "my-simple-compressor":
-        # Load your custom trained checkpoint
-        checkpoint_path = "C:\\Users\\User\\Downloads\\AUB\\Fall 25-26\\Fyp\\compressai\\checkpoint_best_loss-1eb95707.pth.tar"
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        state_dict = checkpoint.get("network", checkpoint)
-        net = my_model.MyHyperpriorCompressor.from_state_dict(state_dict).to(device).eval()
-    else:
-        model_info = models[model]
-        net = model_info(quality=quality, metric=metric, pretrained=True).to(device).eval()
-
+    model_info = models[model]
+    net = model_info(quality=quality, metric=metric, pretrained=True).to(device).eval()
     codec_type = (
         CodecType.IMAGE_CODEC if model in image_models else CodecType.VIDEO_CODEC
     )
@@ -479,19 +469,12 @@ def _decode(inputpath, coder, show, device, output=None):
         original_bitdepth = read_uchars(f, 1)[0]
 
         start = time.time()
-        if model == "my-simple-compressor":
-            checkpoint_path = "C:\\Users\\User\\Downloads\\AUB\\Fall 25-26\\Fyp\\compressai\\checkpoint_best_loss-1eb95707.pth.tar"
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            state_dict = checkpoint.get("network", checkpoint)
-            net = my_model.MyHyperpriorCompressor.from_state_dict(state_dict).to(device).eval()
-        else:
-            model_info = models[model]
-            net = (
-                model_info(quality=quality, metric=metric, pretrained=True)
-                .to(device)
-                .eval()
-            )
-
+        model_info = models[model]
+        net = (
+            model_info(quality=quality, metric=metric, pretrained=True)
+            .to(device)
+            .eval()
+        )
         codec_type = (
             CodecType.IMAGE_CODEC if model in image_models else CodecType.VIDEO_CODEC
         )

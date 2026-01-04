@@ -4,7 +4,7 @@
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted (subject to the limitations in the disclaimer
 # below) provided that the following conditions are met:
-#
+
 # * Redistributions of source code must retain the above copyright notice,
 #   this list of conditions and the following disclaimer.
 # * Redistributions in binary form must reproduce the above copyright notice,
@@ -13,7 +13,7 @@
 # * Neither the name of InterDigital Communications, Inc nor the names of its
 #   contributors may be used to endorse or promote products derived from this
 #   software without specific prior written permission.
-#
+
 # NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY
 # THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
 # CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT
@@ -80,22 +80,6 @@ def configure_optimizers(net, args):
     }
     optimizer = net_aux_optimizer(net, conf)
     return optimizer["net"], optimizer["aux"]
-
-
-def freeze_for_partial_finetune(net):
-    """
-    Partial fine-tuning:
-    - Freeze encoder (g_a) and hyper-encoder (h_a).
-    - Keep decoder (g_s), hyper-decoder (h_s), and entropy-model (aux params) trainable.
-    This assumes CompressAI naming: g_a, g_s, h_a, h_s, entropy_bottleneck, gaussian_conditional, etc.
-    """
-    for name, param in net.named_parameters():
-        # encoder & hyper-encoder: frozen
-        if name.startswith("g_a") or name.startswith("h_a"):
-            param.requires_grad = False
-        else:
-            # Everything else (decoder, hyper-decoder, entropy modules) stays trainable
-            param.requires_grad = True
 
 
 def train_one_epoch(
@@ -184,13 +168,6 @@ def parse_args(argv):
         "-d", "--dataset", type=str, required=True, help="Training dataset"
     )
     parser.add_argument(
-        "-q",
-        "--quality",
-        type=int,
-        default=3,
-        help="Quality level for pretrained model (default: %(default)s)",
-    )
-    parser.add_argument(
         "-e",
         "--epochs",
         default=100,
@@ -263,8 +240,6 @@ def main(argv):
         torch.manual_seed(args.seed)
         random.seed(args.seed)
 
-    # Increase patch size at run time, e.g.:
-    #   --patch-size 512 512
     train_transforms = transforms.Compose(
         [transforms.RandomCrop(args.patch_size), transforms.ToTensor()]
     )
@@ -294,17 +269,13 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    net = image_models[args.model](quality=args.quality, pretrained=True)
+    net = image_models[args.model](quality=3)
     net = net.to(device)
 
     if args.cuda and torch.cuda.device_count() > 1:
         net = CustomDataParallel(net)
 
-    # Create optimizers first (with all parameters trainable)
     optimizer, aux_optimizer = configure_optimizers(net, args)
-    
-    # Then freeze the parameters for partial fine-tuning
-    freeze_for_partial_finetune(net)
     lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
     criterion = RateDistortionLoss(lmbda=args.lmbda)
 

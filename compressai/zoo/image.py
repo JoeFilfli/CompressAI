@@ -37,10 +37,7 @@ from compressai.models import (
     JointAutoregressiveHierarchicalPriors,
     MeanScaleHyperprior,
     ScaleHyperprior,
-    MyHyperpriorCompressor
 )
-
-from compressai.models import my_model
 
 from .pretrained import load_pretrained
 
@@ -62,7 +59,6 @@ model_architectures = {
     "mbt2018": JointAutoregressiveHierarchicalPriors,
     "cheng2020-anchor": Cheng2020Anchor,
     "cheng2020-attn": Cheng2020Attention,
-    "my-simple-compressor": MyHyperpriorCompressor,
 }
 
 root_url = "https://compressai.s3.amazonaws.com/models/v1"
@@ -313,30 +309,6 @@ def bmshj2018_factorized(
     return _load_model(
         "bmshj2018-factorized", metric, quality, pretrained, progress, **kwargs
     )
-
-def MyHyperpriorCompressor(
-        quality, metric="mse", pretrained=False, progress=True, **kwargs
-    ):
-        r"""Factorized Prior model from J. Balle, D. Minnen, S. Singh, S.J. Hwang,
-        N. Johnston: `"Variational Image Compression with a Scale Hyperprior"
-        <https://arxiv.org/abs/1802.01436>`_, Int Conf. on Learning Representations
-        (ICLR), 2018.
-
-        Args:
-            quality (int): Quality levels (1: lowest, highest: 8)
-            metric (str): Optimized metric, choose from ('mse', 'ms-ssim')
-            pretrained (bool): If True, returns a pre-trained model
-            progress (bool): If True, displays a progress bar of the download to stderr
-        """
-        if metric not in ("mse", "ms-ssim"):
-            raise ValueError(f'Invalid metric "{metric}"')
-
-        if quality < 1 or quality > 8:
-            raise ValueError(f'Invalid quality "{quality}", should be between (1, 8)')
-
-        return _load_model(
-            "bmshj2018-factorized", metric, quality, pretrained, progress, **kwargs
-        )
 
 
 def bmshj2018_factorized_relu(

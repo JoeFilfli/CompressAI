@@ -53,9 +53,6 @@ import compressai
 from compressai.ops import compute_padding
 from compressai.zoo import image_models as pretrained_models
 from compressai.zoo.image import model_architectures as architectures
-from compressai.models import my_model
-architectures["my-simple-compressor"] = my_model.MyHyperpriorCompressor
-
 from compressai.zoo.image_vbr import model_architectures as architectures_vbr
 
 torch.backends.cudnn.deterministic = True
