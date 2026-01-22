@@ -154,12 +154,13 @@ class FactorizedPriorWavelet(CompressionModel):
         }
     @classmethod
     def from_state_dict(cls, state_dict):
-        """
-        Required by compressai.utils.eval_model
-        Reconstructs the model with correct N and M.
-        """
+        # Remove DataParallel prefix
+        clean_state = {
+            k.replace("module.", ""): v for k, v in state_dict.items()
+        }
+        state_dict = clean_state
 
-        # Infer N from WaveletEncoder first conv: conv(12 -> N)
+        # Infer N from first encoder conv
         N = state_dict["g_a.net.0.weight"].size(0)
 
         # Infer M from entropy bottleneck
