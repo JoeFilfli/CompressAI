@@ -35,12 +35,14 @@ from .image import (
     cheng2020_attn,
     mbt2018,
     mbt2018_mean,
+    bmshj2018_factorized_wavelet,
 )
 from .image_vbr import bmshj2018_hyperprior_vbr, mbt2018_mean_vbr, mbt2018_vbr
 from .pretrained import load_pretrained as load_state_dict
 from .video import ssf2020
 
 image_models = {
+    "bmshj2018-factorized-wavelet": bmshj2018_factorized_wavelet,
     "bmshj2018-factorized": bmshj2018_factorized,
     "bmshj2018-factorized-relu": bmshj2018_factorized_relu,
     "bmshj2018-hyperprior": bmshj2018_hyperprior,

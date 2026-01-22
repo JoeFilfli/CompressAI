@@ -50,6 +50,7 @@ from .utils import conv, deconv
 __all__ = [
     "CompressionModel",
     "FactorizedPrior",
+    "FactorizedPriorWavelet",
     "FactorizedPriorReLU",
     "ScaleHyperprior",
     "MeanScaleHyperprior",
@@ -60,6 +61,117 @@ __all__ = [
     "SCALES_LEVELS",
 ]
 
+class HaarTransform(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        ll = torch.tensor([[1., 1.],
+                           [1., 1.]]) * 0.5
+        lh = torch.tensor([[1., 1.],
+                           [-1., -1.]]) * 0.5
+        hl = torch.tensor([[1., -1.],
+                           [1., -1.]]) * 0.5
+        hh = torch.tensor([[1., -1.],
+                           [-1., 1.]]) * 0.5
+
+        filters = torch.stack([ll, lh, hl, hh])  # (4, 2, 2)
+        self.register_buffer("filters", filters)
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        B, C, H, W = x.shape
+
+        # Repeat filters for each input channel
+        weight = self.filters.unsqueeze(1)      # (4, 1, 2, 2)
+        weight = weight.repeat(C, 1, 1, 1)      # (4*C, 1, 2, 2)
+
+        # Grouped conv: one Haar bank per channel
+        out = F.conv2d(
+            x,
+            weight,
+            stride=2,
+            padding=0,
+            groups=C,
+        )
+
+        # Output shape: (B, 4*C, H/2, W/2)
+        return out
+
+class WaveletEncoder(nn.Module):
+    def __init__(self, N, M):
+        super().__init__()
+
+        self.dwt = HaarTransform()
+
+        self.net = nn.Sequential(
+            conv(12, N),      # 3 RGB → 12 wavelet channels
+            GDN(N),
+            conv(N, N),
+            GDN(N),
+            conv(N, M),
+        )
+
+    def forward(self, x):
+        x = self.dwt(x)
+        x = self.net(x)
+        return x
+    
+@register_model("bmshj2018-factorized-wavelet")
+class FactorizedPriorWavelet(CompressionModel):
+    def __init__(self, N=128, M=192, **kwargs):
+        super().__init__(**kwargs)
+
+        # --------------------------------------------------
+        # Encoder (LiteVAE-style)
+        # --------------------------------------------------
+        self.g_a = WaveletEncoder(N, M)
+
+        # --------------------------------------------------
+        # Entropy bottleneck (unchanged)
+        # --------------------------------------------------
+        self.entropy_bottleneck = EntropyBottleneck(M)
+
+        # --------------------------------------------------
+        # Decoder (unchanged from bmshj2018-factorized)
+        # --------------------------------------------------
+        self.g_s = nn.Sequential(
+            deconv(M, N),
+            GDN(N, inverse=True),
+            deconv(N, N),
+            GDN(N, inverse=True),
+            deconv(N, N),
+            GDN(N, inverse=True),
+            deconv(N, 3),
+        )
+
+        self.N = N
+        self.M = M
+
+    @property
+    def downsampling_factor(self):
+        # Wavelet downsamples by 2
+        return 2
+
+    def forward(self, x):
+        y = self.g_a(x)
+        y_hat, y_likelihoods = self.entropy_bottleneck(y)
+        x_hat = self.g_s(y_hat)
+
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {"y": y_likelihoods},
+        }
+
+    def compress(self, x):
+        y = self.g_a(x)
+        y_strings = self.entropy_bottleneck.compress(y)
+        return {"strings": [y_strings], "shape": y.size()[-2:]}
+
+    def decompress(self, strings, shape):
+        y_hat = self.entropy_bottleneck.decompress(strings[0], shape)
+        x_hat = self.g_s(y_hat).clamp_(0, 1)
+        return {"x_hat": x_hat}
+    
 
 @register_model("bmshj2018-factorized")
 class FactorizedPrior(CompressionModel):
