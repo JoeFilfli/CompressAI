@@ -121,19 +121,10 @@ class FactorizedPriorWavelet(CompressionModel):
     def __init__(self, N=128, M=192, **kwargs):
         super().__init__(**kwargs)
 
-        # --------------------------------------------------
-        # Encoder (LiteVAE-style)
-        # --------------------------------------------------
         self.g_a = WaveletEncoder(N, M)
 
-        # --------------------------------------------------
-        # Entropy bottleneck (unchanged)
-        # --------------------------------------------------
         self.entropy_bottleneck = EntropyBottleneck(M)
 
-        # --------------------------------------------------
-        # Decoder (unchanged from bmshj2018-factorized)
-        # --------------------------------------------------
         self.g_s = nn.Sequential(
             deconv(M, N),
             GDN(N, inverse=True),
