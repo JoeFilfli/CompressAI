@@ -161,6 +161,22 @@ class FactorizedPriorWavelet(CompressionModel):
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods},
         }
+    @classmethod
+    def from_state_dict(cls, state_dict):
+        """
+        Required by compressai.utils.eval_model
+        Reconstructs the model with correct N and M.
+        """
+
+        # Infer N from WaveletEncoder first conv: conv(12 -> N)
+        N = state_dict["g_a.net.0.weight"].size(0)
+
+        # Infer M from entropy bottleneck
+        M = state_dict["entropy_bottleneck.quantiles"].size(0)
+
+        net = cls(N=N, M=M)
+        net.load_state_dict(state_dict)
+        return net
 
     def compress(self, x):
         y = self.g_a(x)
