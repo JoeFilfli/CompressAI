@@ -404,7 +404,9 @@ def decode_image(f, codec: CodecInfo, output):
             with Path(output).open("wb") as fout:
                 write_frame(fout, rec, codec.original_bitdepth)
         else:
+            #img.save(output, format="JPEG", quality=95)
             img.save(output)
+
 
     return {"img": img}
 
