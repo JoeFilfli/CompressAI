@@ -142,3 +142,8 @@ dmypy.json
 
 # PyCharm
 .idea/
+
+*.data
+*.onnx
+*.tar
+*.jpg

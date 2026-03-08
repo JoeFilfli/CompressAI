@@ -7,7 +7,7 @@ import torch
 
 # -------- CONFIG --------
 INPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\images2_compressed")
-OUTPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\images2_decoded")
+OUTPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\images22_decoded")
 CODER = compressai.available_entropy_coders()[0]
 DEVICE = "cpu"  # or "cuda"
 # ------------------------

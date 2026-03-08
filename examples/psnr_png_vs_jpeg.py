@@ -14,7 +14,7 @@ from compressai.ops import compute_padding
 
 
 # ================= CONFIG =================
-INPUT_DIR = Path("C:/Users/User/Downloads/AUB/Fyp/images2")
+INPUT_DIR = Path("C:/Users/User/Downloads/AUB/Fyp/images22")
 TMP_DIR = Path("C:/Users/User/Downloads/AUB/Fyp/tmp_outputs")
 
 MODEL = "bmshj2018-factorized"
