@@ -3,12 +3,12 @@ Symbols: 294,912  |  CDFs: 192  |  Max CDF len: 75
 === Pure C++ (avg of 20 warm runs) ===
                                      rANS       tANS    Speedup
 --------------------------------------------------------------
-Encode (ms)                          8.47       6.34      1.34x
-Decode (ms)                          5.55       4.85      1.14x
+Encode (ms)                         20.21      12.66      1.60x
+Decode (ms)                         12.35      12.88      0.96x
 Bitstream (bytes)                    8320       8678      0.96x
 
-tANS cold encode (table build + encode): 19.54 ms
-tANS cold decode (table build + decode): 18.81 ms
+tANS cold encode (table build + encode): 45.92 ms
+tANS cold decode (table build + decode): 41.78 ms
 
 === Table memory (R=10, L=1024) ===
 Encoding tables (CTable): 7385 KB  (7.2 MB)
