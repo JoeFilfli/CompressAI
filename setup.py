@@ -73,6 +73,7 @@ def get_extensions():
     rans_lib_dir = cwd / "third_party/ryg_rans"
     rans_ext_dir = ext_dirs / "rans"
     ops_ext_dir = ext_dirs / "ops"
+    tans_ext_dir = ext_dirs / "tans"
 
     def find_sources(path):
         return [str(p.relative_to(cwd)) for p in path.glob("*.cpp")]
@@ -95,6 +96,13 @@ def get_extensions():
             name=f"{package_name}._CXX",
             sources=find_sources(ops_ext_dir),
             language="c++",
+            extra_compile_args=extra_compile_args,
+        ),
+        Pybind11Extension(
+            name=f"{package_name}.tans",
+            sources=find_sources(tans_ext_dir),
+            language="c++",
+            include_dirs=[tans_ext_dir],
             extra_compile_args=extra_compile_args,
         ),
     ]
