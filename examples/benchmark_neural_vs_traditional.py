@@ -50,7 +50,7 @@ from PIL import Image
 from torchvision import transforms
 
 from compressai.ops import compute_padding
-from compressai.zoo import bmshj2018_factorized, mbt2018_mean, cheng2020_anchor
+from compressai.zoo import bmshj2018_factorized, mbt2018_mean
 
 # ─────────────────────────────────────────────────────────────
 # AVIF SUPPORT — optional, gracefully disabled if not installed
@@ -90,8 +90,7 @@ ALL_EXTENSIONS = LOSSLESS_EXTENSIONS | LOSSY_EXTENSIONS
 
 NEURAL_MODELS = {
     "bmshj2018-factorized": bmshj2018_factorized,
-    "mbt2018-mean":         mbt2018_mean,
-    "cheng2020-anchor":     cheng2020_anchor,
+    "mbt2018-mean":         mbt2018_mean
 }
 
 NEURAL_QUALITIES_BY_MODEL = {
