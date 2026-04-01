@@ -16,13 +16,15 @@ import compressai
 import warnings
 warnings.filterwarnings("ignore")
 
+EXAMPLES_DIR = Path(__file__).resolve().parent
+
 # -------- CONFIG --------
-INPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\images22")
+INPUT_DIR = EXAMPLES_DIR / "high_quality_images"
 MODEL = "bmshj2018-factorized"
 QUALITY = 1
 METRIC = "mse"
 DEVICE = "cpu"
-ONNX_DIR = Path("model_onnx")
+ONNX_DIR = EXAMPLES_DIR / "model_onnx"
 NUM_IMAGES = 5  # Profile on first N images
 WARMUP = 2
 # ------------------------
@@ -178,7 +180,7 @@ try:
     if onnx_path is None:
         # Export encoder to ONNX on the fly
         print(f"  No ONNX model found, exporting encoder...")
-        onnx_path = Path("model_onnx") / f"{MODEL}_q{QUALITY}_encoder.onnx"
+        onnx_path = ONNX_DIR / f"{MODEL}_q{QUALITY}_encoder.onnx"
         onnx_path.parent.mkdir(exist_ok=True)
         
         dummy = torch.randn(1, 3, 1024, 1024)

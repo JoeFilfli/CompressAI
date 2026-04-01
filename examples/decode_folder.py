@@ -5,9 +5,11 @@ from examples.codec import decode_image, CodecInfo, parse_header, read_uints, re
 import compressai
 import torch
 
+EXAMPLES_DIR = Path(__file__).resolve().parent
+
 # -------- CONFIG --------
-INPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\images2_compressed")
-OUTPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\images22_decoded")
+INPUT_DIR = EXAMPLES_DIR / "images2_compressed"
+OUTPUT_DIR = EXAMPLES_DIR / "images2_decoded"
 CODER = compressai.available_entropy_coders()[0]
 DEVICE = "cpu"  # or "cuda"
 # ------------------------

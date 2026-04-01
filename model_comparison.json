@@ -1,0 +1,63 @@
+{
+  "config": {
+    "models": [
+      "bmshj2018-factorized",
+      "mbt2018"
+    ],
+    "quality_levels": [
+      1
+    ],
+    "num_images": 1,
+    "device": "cpu"
+  },
+  "per_image_results": [
+    {
+      "model_name": "bmshj2018-factorized",
+      "quality": 1,
+      "width": 768,
+      "height": 512,
+      "bpp": 0.16463216145833334,
+      "psnr": 24.743168354034424,
+      "ms_ssim": 0.8984489440917969,
+      "compressed_bytes": 8092,
+      "encode_time_ms": 172.98736200064013,
+      "decode_time_ms": 218.96542900140048,
+      "total_time_ms": 391.9527910020406,
+      "num_parameters": 2998147,
+      "image_name": "kodim01.png"
+    },
+    {
+      "model_name": "mbt2018",
+      "quality": 1,
+      "width": 768,
+      "height": 512,
+      "bpp": 0.163330078125,
+      "psnr": 25.622975826263428,
+      "ms_ssim": 0.9181440472602844,
+      "compressed_bytes": 8028,
+      "encode_time_ms": 2193.3719529988593,
+      "decode_time_ms": 7697.529872999439,
+      "total_time_ms": 9890.901825998299,
+      "num_parameters": 14130467,
+      "image_name": "kodim01.png"
+    }
+  ],
+  "summary": {
+    "1": {
+      "bmshj2018-factorized": {
+        "avg_bpp": 0.16463216145833334,
+        "avg_psnr": 24.743168354034424,
+        "avg_ms_ssim": 0.8984489440917969,
+        "avg_encode_ms": 172.98736200064013,
+        "avg_decode_ms": 218.96542900140048
+      },
+      "mbt2018": {
+        "avg_bpp": 0.163330078125,
+        "avg_psnr": 25.622975826263428,
+        "avg_ms_ssim": 0.9181440472602844,
+        "avg_encode_ms": 2193.3719529988593,
+        "avg_decode_ms": 7697.529872999439
+      }
+    }
+  }
+}

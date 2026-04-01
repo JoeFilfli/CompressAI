@@ -14,9 +14,11 @@ from torchvision.transforms import ToTensor
 from examples.codec import get_header, CodecType, write_uchars, write_uints, write_body
 import struct
 
+EXAMPLES_DIR = Path(__file__).resolve().parent
+
 # -------- CONFIG --------
-INPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\images2")
-OUTPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\images2_batch_compressed")
+INPUT_DIR = EXAMPLES_DIR / "kodak"
+OUTPUT_DIR = EXAMPLES_DIR / "images2_batch_compressed"
 MODEL = "bmshj2018-factorized"
 QUALITY = 3
 METRIC = "mse"

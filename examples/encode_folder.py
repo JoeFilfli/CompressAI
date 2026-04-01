@@ -6,9 +6,11 @@ import compressai
 import torch
 from PIL import Image
 
+EXAMPLES_DIR = Path(__file__).resolve().parent
+
 # -------- CONFIG --------
-INPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\kodak")
-OUTPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\images2_compressed")
+INPUT_DIR = EXAMPLES_DIR / "kodak"
+OUTPUT_DIR = EXAMPLES_DIR / "images2_compressed"
 CROP_SIZE = 512  # Crop images to 512x512
 MODEL = "bmshj2018-factorized"
 QUALITY = 1

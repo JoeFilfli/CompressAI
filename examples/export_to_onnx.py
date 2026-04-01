@@ -9,8 +9,11 @@ from pathlib import Path
 from compressai.zoo import models
 import compressai
 
+EXAMPLES_DIR = Path(__file__).resolve().parent
+DEFAULT_ONNX_DIR = EXAMPLES_DIR / "model_onnx"
+
 def export_model_to_onnx(model_name="bmshj2018-factorized", quality=1, metric="mse", 
-                         output_path="model_onnx", device="cpu"):
+                         output_path=str(DEFAULT_ONNX_DIR), device="cpu"):
     """
     Export CompressAI model to ONNX format
     
@@ -152,7 +155,7 @@ if __name__ == "__main__":
                         help="Quality level (1-8)")
     parser.add_argument("--metric", type=str, default="mse",
                         help="Metric (mse or ms-ssim)")
-    parser.add_argument("--output", type=str, default="model_onnx",
+    parser.add_argument("--output", type=str, default=str(DEFAULT_ONNX_DIR),
                         help="Output directory")
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device (cpu or cuda)")

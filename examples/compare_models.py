@@ -29,6 +29,8 @@ import compressai
 from compressai.ops import compute_padding
 from compressai.zoo import models
 
+EXAMPLES_DIR = Path(__file__).resolve().parent
+
 # AVIF/HEIF support for input images
 try:
     import pillow_heif
@@ -361,7 +363,7 @@ def run_comparison(
 
 def main():
     parser = argparse.ArgumentParser(description="Compare neural compression models")
-    parser.add_argument("--input-dir", type=str, default="C:/Users/User/Downloads/AUB/Fyp/kodak",
+    parser.add_argument("--input-dir", type=str, default=str(EXAMPLES_DIR / "kodak"),
                         help="Directory containing test images")
     parser.add_argument("--output", type=str, default="model_comparison.json",
                         help="Output JSON file")

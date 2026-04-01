@@ -25,15 +25,17 @@ except ImportError:
     print("Install with: pip install onnxruntime")
     exit(1)
 
+EXAMPLES_DIR = Path(__file__).resolve().parent
+
 # -------- CONFIG --------
-INPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\images2")
-OUTPUT_DIR = Path("C:\\Users\\User\\Downloads\\AUB\\Fyp\\images2_onnx_compressed")
+INPUT_DIR = EXAMPLES_DIR / "kodak"
+OUTPUT_DIR = EXAMPLES_DIR / "images2_onnx_compressed"
 MODEL = "bmshj2018-factorized"
 QUALITY = 3
 METRIC = "mse"
 CODER = compressai.available_entropy_coders()[0]
 DEVICE = "cpu"
-ONNX_MODEL_DIR = Path("model_onnx")
+ONNX_MODEL_DIR = EXAMPLES_DIR / "model_onnx"
 # ------------------------
 
 def load_onnx_session(onnx_path, device="cpu"):

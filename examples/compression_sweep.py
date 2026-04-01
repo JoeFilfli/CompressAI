@@ -26,6 +26,8 @@ import compressai
 from compressai.ops import compute_padding
 from compressai.zoo import models
 
+EXAMPLES_DIR = Path(__file__).resolve().parent
+
 # AVIF support
 try:
     import pillow_avif
@@ -286,7 +288,7 @@ def run_sweep(
 def main():
     parser = argparse.ArgumentParser(description="Neural compression quality sweep")
     parser.add_argument("--input-dir", type=str, 
-                        default="C:/Users/User/Downloads/AUB/Fyp/high_quality_images",
+                        default=str(EXAMPLES_DIR / "high_quality_images"),
                         help="Directory containing images")
     parser.add_argument("--output", type=str, default="sweep_results.json",
                         help="Output JSON file")

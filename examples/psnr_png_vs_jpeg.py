@@ -12,10 +12,12 @@ import compressai
 from compressai.zoo import models
 from compressai.ops import compute_padding
 
+EXAMPLES_DIR = Path(__file__).resolve().parent
+
 
 # ================= CONFIG =================
-INPUT_DIR = Path("C:/Users/User/Downloads/AUB/Fyp/images22")
-TMP_DIR = Path("C:/Users/User/Downloads/AUB/Fyp/tmp_outputs")
+INPUT_DIR = EXAMPLES_DIR / "high_quality_images"
+TMP_DIR = EXAMPLES_DIR / "tmp_outputs"
 
 MODEL = "bmshj2018-factorized"
 QUALITY = 1

@@ -123,6 +123,8 @@ MARKERS = {
     "AVIF":                 "P",
 }
 
+EXAMPLES_DIR = Path(__file__).resolve().parent
+
 # ─────────────────────────────────────────────────────────────
 # INPUT VALIDATION
 # ─────────────────────────────────────────────────────────────
@@ -616,7 +618,7 @@ def main():
     )
     parser.add_argument(
         "--input-dir", type=str,
-        default="C:/Users/User/Downloads/AUB/Fyp/kodak",
+        default=str(EXAMPLES_DIR / "kodak"),
         help="Folder containing input images"
     )
     parser.add_argument(
