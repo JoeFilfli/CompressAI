@@ -2,35 +2,44 @@
 Benchmark: Neural Compression vs Traditional Codecs
 
 Models tested:
-    Neural:      bmshj2018-factorized, mbt2018-mean, cheng2020-anchor
+    Neural:      bmshj2018-factorized
     Traditional: JPEG, WebP, AVIF
 
 Measures per image per quality level:
     BPP         — bits per pixel (lower = smaller file)
     PSNR        — reconstruction quality in dB (higher = better)
+    MS-SSIM     — structural perceptual quality (higher = better)
+    LPIPS       — deep perceptual distance (lower = better)
     Encode time — compression time in ms
     Decode time — decompression time in ms
 
 Output:
     benchmark_results.json  — raw numbers for every image/quality
-    rd_curve.png            — Rate-Distortion curves (main result)
+    rd_curve.png            — Figure 1: BPP vs PSNR
+    rd_msssim.png           — Figure 2: BPP vs MS-SSIM
+    rd_lpips.png            — Figure 3: BPP vs LPIPS
+    bd_rate_results.json    — Figure 4 data: pairwise BD-Rate table
+    bd_rate_table.png       — Figure 4: pairwise BD-Rate table image
     runtime_chart.png       — Encode/Decode time comparison
 
 Usage:
     # Standard Kodak benchmark (PNG input — valid for paper comparison):
-    python benchmark_kodak.py --input-dir ./kodak
+    python benchmark_neural_vs_traditional.py --input-dir ./kodak
 
     # Photographer experiment (JPEG/AVIF input — different research question):
-    python benchmark_kodak.py --input-dir ./my_photos --source-type lossy
+    python benchmark_neural_vs_traditional.py --input-dir ./my_photos --source-type lossy
 
     # Quick sanity check (5 images only):
-    python benchmark_kodak.py --input-dir ./kodak --max-images 5
+    python benchmark_neural_vs_traditional.py --input-dir ./kodak --max-images 5
 
     # With GPU:
-    python benchmark_kodak.py --input-dir ./kodak --device cuda
+    python benchmark_neural_vs_traditional.py --input-dir ./kodak --device cuda
 
 AVIF support requires:
     pip install pillow-heif
+
+Optional perceptual metrics:
+    pip install pytorch-msssim lpips
 """
 
 import argparse
@@ -50,7 +59,23 @@ from PIL import Image
 from torchvision import transforms
 
 from compressai.ops import compute_padding
-from compressai.zoo import bmshj2018_factorized, mbt2018_mean
+from compressai.zoo import bmshj2018_factorized
+
+try:
+    from pytorch_msssim import ms_ssim as compute_msssim
+    MSSSIM_AVAILABLE = True
+except ImportError:
+    compute_msssim = None
+    MSSSIM_AVAILABLE = False
+    print("⚠️  MS-SSIM unavailable — install with: pip install pytorch-msssim")
+
+try:
+    import lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    lpips = None
+    LPIPS_AVAILABLE = False
+    print("⚠️  LPIPS unavailable — install with: pip install lpips")
 
 # ─────────────────────────────────────────────────────────────
 # AVIF SUPPORT — optional, gracefully disabled if not installed
@@ -90,13 +115,10 @@ ALL_EXTENSIONS = LOSSLESS_EXTENSIONS | LOSSY_EXTENSIONS
 
 NEURAL_MODELS = {
     "bmshj2018-factorized": bmshj2018_factorized,
-    "mbt2018-mean":         mbt2018_mean
 }
 
 NEURAL_QUALITIES_BY_MODEL = {
     "bmshj2018-factorized": [1, 2, 3, 4, 5, 6, 7, 8],
-    "mbt2018-mean":         [1, 2, 3, 4, 5, 6, 7, 8],
-    "cheng2020-anchor":     [1, 2, 3, 4, 5, 6],
 }
 
 JPEG_QUALITIES = [5, 10, 15, 20, 30, 40, 55, 70, 80, 90, 95]
@@ -107,8 +129,6 @@ AVIF_QUALITIES = [10, 20, 30, 40, 50, 60, 70, 80, 90]
 
 COLORS = {
     "bmshj2018-factorized": "#2ecc71",
-    "mbt2018-mean":         "#e67e22",
-    "cheng2020-anchor":     "#9b59b6",
     "JPEG":                 "#e74c3c",
     "WebP":                 "#3498db",
     "AVIF":                 "#f39c12",
@@ -116,14 +136,14 @@ COLORS = {
 
 MARKERS = {
     "bmshj2018-factorized": "^",
-    "mbt2018-mean":         "D",
-    "cheng2020-anchor":     "v",
     "JPEG":                 "o",
     "WebP":                 "s",
     "AVIF":                 "P",
 }
 
 EXAMPLES_DIR = Path(__file__).resolve().parent
+LPIPS_MODELS: Dict[str, torch.nn.Module] = {}
+LPIPS_INIT_FAILED = False
 
 # ─────────────────────────────────────────────────────────────
 # INPUT VALIDATION
@@ -204,6 +224,185 @@ def calculate_bpp(compressed_bytes: int, height: int, width: int) -> float:
     return (compressed_bytes * 8) / (height * width)
 
 
+def calculate_ms_ssim(
+    original: torch.Tensor, reconstructed: torch.Tensor
+) -> Optional[float]:
+    if not MSSSIM_AVAILABLE:
+        return None
+    return float(compute_msssim(original, reconstructed, data_range=1.0).item())
+
+
+def get_lpips_model(device: str):
+    global LPIPS_INIT_FAILED
+
+    if not LPIPS_AVAILABLE:
+        return None
+    if LPIPS_INIT_FAILED:
+        return None
+
+    model = LPIPS_MODELS.get(device)
+    if model is None:
+        try:
+            model = lpips.LPIPS(net="alex").eval().to(device)
+        except Exception as exc:
+            LPIPS_INIT_FAILED = True
+            print(f"⚠️  LPIPS disabled — could not initialize model: {exc}")
+            return None
+        LPIPS_MODELS[device] = model
+    return model
+
+
+def calculate_lpips(
+    original: torch.Tensor, reconstructed: torch.Tensor, device: str
+) -> Optional[float]:
+    model = get_lpips_model(device)
+    if model is None:
+        return None
+
+    with torch.inference_mode():
+        original_scaled = original.to(device) * 2 - 1
+        reconstructed_scaled = reconstructed.to(device) * 2 - 1
+        return float(model(original_scaled, reconstructed_scaled).item())
+
+
+def average_or_none(values: List[Optional[float]], digits: Optional[int] = None) -> Optional[float]:
+    filtered = [v for v in values if v is not None]
+    if not filtered:
+        return None
+
+    avg = float(np.mean(filtered))
+    if digits is None:
+        return avg
+    return round(avg, digits)
+
+
+def format_metric(value: Optional[float], fmt: str, missing: str = "n/a") -> str:
+    if value is None:
+        return missing
+    return format(value, fmt)
+
+
+def metric_suffix(result: Dict) -> str:
+    parts = []
+    if result.get("ms_ssim") is not None:
+        parts.append(f"MS-SSIM: {result['ms_ssim']:.4f}")
+    if result.get("lpips") is not None:
+        parts.append(f"LPIPS: {result['lpips']:.4f}")
+    return " | ".join(parts)
+
+
+def bd_rate(rate1, metric1, rate2, metric2) -> Optional[float]:
+    """Bjontegaard Delta Rate: negative means codec2 needs fewer bits."""
+    if len(rate1) < 2 or len(rate2) < 2:
+        return None
+
+    points1 = sorted(zip(metric1, rate1))
+    points2 = sorted(zip(metric2, rate2))
+    metric1_sorted, rate1_sorted = zip(*points1)
+    metric2_sorted, rate2_sorted = zip(*points2)
+
+    min_metric = max(min(metric1_sorted), min(metric2_sorted))
+    max_metric = min(max(metric1_sorted), max(metric2_sorted))
+    if max_metric <= min_metric:
+        return None
+
+    degree = min(3, len(rate1_sorted) - 1, len(rate2_sorted) - 1)
+    if degree < 1:
+        return None
+
+    log_rate1 = np.log(np.asarray(rate1_sorted))
+    log_rate2 = np.log(np.asarray(rate2_sorted))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        p1 = np.polyfit(metric1_sorted, log_rate1, degree)
+        p2 = np.polyfit(metric2_sorted, log_rate2, degree)
+
+    p_int1 = np.polyint(p1)
+    p_int2 = np.polyint(p2)
+
+    int1 = np.polyval(p_int1, max_metric) - np.polyval(p_int1, min_metric)
+    int2 = np.polyval(p_int2, max_metric) - np.polyval(p_int2, min_metric)
+
+    avg_diff = (int2 - int1) / (max_metric - min_metric)
+    return float((np.exp(avg_diff) - 1) * 100)
+
+
+def compute_bd_rate_table(results: Dict) -> Dict[str, Dict[str, Optional[float]]]:
+    codecs = [
+        codec_name
+        for codec_name, quality_points in results.items()
+        if len([p for p in quality_points if p.get("avg_psnr") is not None]) >= 2
+    ]
+
+    table: Dict[str, Dict[str, Optional[float]]] = {}
+    for reference_codec in codecs:
+        table[reference_codec] = {}
+        ref_points = sorted(results[reference_codec], key=lambda x: x["avg_bpp"])
+        ref_rates = [p["avg_bpp"] for p in ref_points]
+        ref_psnr = [p["avg_psnr"] for p in ref_points]
+
+        for test_codec in codecs:
+            if reference_codec == test_codec:
+                table[reference_codec][test_codec] = 0.0
+                continue
+
+            test_points = sorted(results[test_codec], key=lambda x: x["avg_bpp"])
+            test_rates = [p["avg_bpp"] for p in test_points]
+            test_psnr = [p["avg_psnr"] for p in test_points]
+            table[reference_codec][test_codec] = bd_rate(
+                ref_rates, ref_psnr, test_rates, test_psnr
+            )
+
+    return table
+
+
+def save_bd_rate_table_image(bd_table: Dict[str, Dict[str, Optional[float]]], output_path: str):
+    if not bd_table:
+        print("  ⚠️  Skipping BD-Rate table image — no comparable curves available")
+        return
+
+    codecs = list(bd_table.keys())
+    cell_text = []
+    for reference_codec in codecs:
+        row = []
+        for test_codec in codecs:
+            value = bd_table[reference_codec][test_codec]
+            if value is None:
+                row.append("n/a")
+            else:
+                row.append(f"{value:+.1f}%")
+        cell_text.append(row)
+
+    fig, ax = plt.subplots(figsize=(max(8, len(codecs) * 2.1), max(3.5, len(codecs) * 0.8 + 1.8)))
+    ax.axis("off")
+    table = ax.table(
+        cellText=cell_text,
+        rowLabels=codecs,
+        colLabels=codecs,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.6)
+
+    for (row, col), cell in table.get_celld().items():
+        if row == 0 or col == -1:
+            cell.set_text_props(weight="bold")
+
+    ax.set_title(
+        "BD-Rate Table (matched PSNR)\n"
+        "Cell[row, col] = bitrate delta of col vs row; negative is better",
+        fontsize=12,
+        pad=18,
+    )
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  ✅ BD-Rate table saved → {output_path}")
+
+
 # ─────────────────────────────────────────────────────────────
 # NEURAL COMPRESSION
 # ─────────────────────────────────────────────────────────────
@@ -231,9 +430,14 @@ def compress_neural(img: Image.Image, model, device: str) -> Dict:
 
         x_hat = F.pad(out_dec["x_hat"], unpad).clamp(0, 1)
 
+    ms_ssim_val = calculate_ms_ssim(x, x_hat)
+    lpips_val = calculate_lpips(x, x_hat, device)
+
     return {
         "bpp":       calculate_bpp(compressed_bytes, h, w),
         "psnr":      calculate_psnr(x, x_hat),
+        "ms_ssim":   ms_ssim_val,
+        "lpips":     lpips_val,
         "encode_ms": encode_ms,
         "decode_ms": decode_ms,
     }
@@ -243,7 +447,7 @@ def compress_neural(img: Image.Image, model, device: str) -> Dict:
 # TRADITIONAL CODECS  (JPEG, WebP, AVIF)
 # ─────────────────────────────────────────────────────────────
 
-def compress_traditional(img: Image.Image, codec: str, quality: int) -> Dict:
+def compress_traditional(img: Image.Image, codec: str, quality: int, device: str) -> Dict:
     """
     Compress one image with JPEG, WebP, or AVIF.
 
@@ -285,10 +489,14 @@ def compress_traditional(img: Image.Image, codec: str, quality: int) -> Dict:
     decode_ms = (time.perf_counter() - t0) * 1000
 
     reconstructed_tensor = transforms.ToTensor()(reconstructed).unsqueeze(0)
+    ms_ssim_val = calculate_ms_ssim(original_tensor, reconstructed_tensor)
+    lpips_val = calculate_lpips(original_tensor, reconstructed_tensor, device)
 
     return {
         "bpp":       calculate_bpp(compressed_bytes, h, w),
         "psnr":      calculate_psnr(original_tensor, reconstructed_tensor),
+        "ms_ssim":   ms_ssim_val,
+        "lpips":     lpips_val,
         "encode_ms": encode_ms,
         "decode_ms": decode_ms,
     }
@@ -303,22 +511,25 @@ def run_traditional_codec(
     qualities: List[int],
     images: List[Path],
     n: int,
+    device: str,
 ) -> List[Dict]:
     """Returns list of per-quality-level averaged results."""
     entries = []
     print(f"\n{'─'*60}\n  {codec}\n{'─'*60}")
 
     for q in qualities:
-        bpps, psnrs, encs, decs = [], [], [], []
+        bpps, psnrs, ms_ssims, lpips_scores, encs, decs = [], [], [], [], [], []
         failed = 0
 
         for img_path in images:
             try:
                 r = compress_traditional(
-                    Image.open(img_path).convert("RGB"), codec, q
+                    Image.open(img_path).convert("RGB"), codec, q, device
                 )
                 bpps.append(r["bpp"])
                 psnrs.append(r["psnr"])
+                ms_ssims.append(r["ms_ssim"])
+                lpips_scores.append(r["lpips"])
                 encs.append(r["encode_ms"])
                 decs.append(r["decode_ms"])
             except Exception as e:
@@ -333,6 +544,8 @@ def run_traditional_codec(
             "quality":       q,
             "avg_bpp":       round(float(np.mean(bpps)),  4),
             "avg_psnr":      round(float(np.mean(psnrs)), 2),
+            "avg_ms_ssim":   average_or_none(ms_ssims, 4),
+            "avg_lpips":     average_or_none(lpips_scores, 4),
             "avg_encode_ms": round(float(np.mean(encs)),  1),
             "avg_decode_ms": round(float(np.mean(decs)),  1),
             "n_images":      len(bpps),
@@ -342,6 +555,8 @@ def run_traditional_codec(
         fail_note = f" ({failed} failed)" if failed else ""
         print(f"  q={q:3d} | BPP: {entry['avg_bpp']:.4f} | "
               f"PSNR: {entry['avg_psnr']:.2f} dB | "
+              f"MS-SSIM: {format_metric(entry['avg_ms_ssim'], '.4f')} | "
+              f"LPIPS: {format_metric(entry['avg_lpips'], '.4f')} | "
               f"Enc: {entry['avg_encode_ms']:.1f}ms | "
               f"Dec: {entry['avg_decode_ms']:.1f}ms{fail_note}")
 
@@ -352,19 +567,58 @@ def run_traditional_codec(
 # PLOTTING
 # ─────────────────────────────────────────────────────────────
 
-def plot_rd_curves(results: Dict, output_path: str, device: str, source_type: str):
+def plot_rd_curves(
+    results: Dict,
+    metric_key: str,
+    output_path: str,
+    device: str,
+    source_type: str,
+):
+    metric_specs = {
+        "psnr": {
+            "entry_key": "avg_psnr",
+            "ylabel": "PSNR [dB]",
+            "title_metric": "PSNR",
+            "lower_is_better": False,
+            "legend_loc": "lower right",
+        },
+        "ms_ssim": {
+            "entry_key": "avg_ms_ssim",
+            "ylabel": "MS-SSIM [higher is better]",
+            "title_metric": "MS-SSIM",
+            "lower_is_better": False,
+            "legend_loc": "lower right",
+        },
+        "lpips": {
+            "entry_key": "avg_lpips",
+            "ylabel": "LPIPS [lower is better]",
+            "title_metric": "LPIPS",
+            "lower_is_better": True,
+            "legend_loc": "upper right",
+        },
+    }
+    spec = metric_specs[metric_key]
+
     plt.figure(figsize=(13, 8))
+    plotted_any = False
 
     for codec_name, quality_points in results.items():
         if not quality_points:
             continue
-        points = sorted(quality_points, key=lambda x: x["avg_bpp"])
-        bpps  = [p["avg_bpp"]  for p in points]
-        psnrs = [p["avg_psnr"] for p in points]
+        points = sorted(
+            [p for p in quality_points if p.get(spec["entry_key"]) is not None],
+            key=lambda x: x["avg_bpp"],
+        )
+        if not points:
+            continue
+
+        bpps = [p["avg_bpp"] for p in points]
+        metric_values = [p[spec["entry_key"]] for p in points]
         is_neural = codec_name in NEURAL_MODELS
+        plotted_any = True
 
         plt.plot(
-            bpps, psnrs,
+            bpps, metric_values,
             color=COLORS.get(codec_name, "black"),
             marker=MARKERS.get(codec_name, "o"),
             linestyle="-" if is_neural else "--",
@@ -373,6 +627,11 @@ def plot_rd_curves(results: Dict, output_path: str, device: str, source_type: st
             label=codec_name,
         )
 
+    if not plotted_any:
+        plt.close()
+        print(f"  ⚠️  Skipping {metric_key.upper()} curve — no data available")
+        return
+
     source_label = (
         "Kodak Dataset — 24 uncompressed PNGs"
         if source_type == "lossless"
@@ -380,20 +639,23 @@ def plot_rd_curves(results: Dict, output_path: str, device: str, source_type: st
     )
 
     plt.xlabel("Bit-rate [bpp]", fontsize=13)
-    plt.ylabel("PSNR [dB]", fontsize=13)
+    plt.ylabel(spec["ylabel"], fontsize=13)
     plt.title(
-        f"Rate-Distortion Curves — {source_label}\n"
+        f"Rate-Distortion Curves ({spec['title_metric']}) — {source_label}\n"
         f"Solid = Neural   |   Dashed = Traditional   |   Device: {device.upper()}",
         fontsize=12
     )
-    plt.legend(fontsize=11, loc="lower right")
+    plt.legend(fontsize=11, loc=spec["legend_loc"])
     plt.grid(True, alpha=0.3)
     plt.xlim(left=0)
-    plt.ylim(bottom=26)
+    if metric_key == "psnr":
+        plt.ylim(bottom=26)
+    elif metric_key == "ms_ssim":
+        plt.ylim(0.0, 1.0)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  ✅ R-D curve saved → {output_path}")
+    print(f"  ✅ {spec['title_metric']} R-D curve saved → {output_path}")
 
 
 def plot_runtime(results: Dict, output_path: str, device: str):
@@ -447,6 +709,10 @@ def run_benchmark(
     source_type: str  = "auto",
     output_json: str  = "benchmark_results.json",
     output_rd:   str  = "rd_curve.png",
+    output_msssim: str = "rd_msssim.png",
+    output_lpips: str = "rd_lpips.png",
+    output_bd_json: str = "bd_rate_results.json",
+    output_bd_table: str = "bd_rate_table.png",
     output_rt:   str  = "runtime_chart.png",
 ):
     # ── Discover images ──────────────────────────────────────
@@ -485,11 +751,11 @@ def run_benchmark(
     results: Dict[str, List[Dict]] = {}
 
     # ── Traditional codecs ───────────────────────────────────
-    results["JPEG"] = run_traditional_codec("JPEG", JPEG_QUALITIES, images, n)
-    results["WebP"] = run_traditional_codec("WebP", WEBP_QUALITIES, images, n)
+    results["JPEG"] = run_traditional_codec("JPEG", JPEG_QUALITIES, images, n, device)
+    results["WebP"] = run_traditional_codec("WebP", WEBP_QUALITIES, images, n, device)
 
     if AVIF_AVAILABLE:
-        results["AVIF"] = run_traditional_codec("AVIF", AVIF_QUALITIES, images, n)
+        results["AVIF"] = run_traditional_codec("AVIF", AVIF_QUALITIES, images, n, device)
     else:
         print("\n  Skipping AVIF (not installed)")
 
@@ -503,7 +769,7 @@ def run_benchmark(
             model = model_fn(quality=q, pretrained=True).eval().to(device)
             model.update()
 
-            bpps, psnrs, encs, decs = [], [], [], []
+            bpps, psnrs, ms_ssims, lpips_scores, encs, decs = [], [], [], [], [], []
             for i, img_path in enumerate(images, 1):
                 try:
                     r = compress_neural(
@@ -511,10 +777,14 @@ def run_benchmark(
                     )
                     bpps.append(r["bpp"])
                     psnrs.append(r["psnr"])
+                    ms_ssims.append(r["ms_ssim"])
+                    lpips_scores.append(r["lpips"])
                     encs.append(r["encode_ms"])
                     decs.append(r["decode_ms"])
+                    extra_metrics = metric_suffix(r)
                     print(f"    [{i:2d}/{n}] {img_path.name} | "
                           f"BPP: {r['bpp']:.4f} | PSNR: {r['psnr']:.2f} dB | "
+                          f"{extra_metrics + ' | ' if extra_metrics else ''}"
                           f"Enc: {r['encode_ms']:.0f}ms | Dec: {r['decode_ms']:.0f}ms")
                 except Exception as e:
                     print(f"    [{i:2d}/{n}] {img_path.name} FAILED: {e}")
@@ -526,6 +796,8 @@ def run_benchmark(
                 "quality":       q,
                 "avg_bpp":       round(float(np.mean(bpps)),  4),
                 "avg_psnr":      round(float(np.mean(psnrs)), 2),
+                "avg_ms_ssim":   average_or_none(ms_ssims, 4),
+                "avg_lpips":     average_or_none(lpips_scores, 4),
                 "avg_encode_ms": round(float(np.mean(encs)),  1),
                 "avg_decode_ms": round(float(np.mean(decs)),  1),
                 "n_images":      len(bpps),
@@ -533,6 +805,8 @@ def run_benchmark(
             results[model_name].append(entry)
             print(f"  ✓ q={q} avg → BPP: {entry['avg_bpp']:.4f} | "
                   f"PSNR: {entry['avg_psnr']:.2f} dB | "
+                  f"MS-SSIM: {format_metric(entry['avg_ms_ssim'], '.4f')} | "
+                  f"LPIPS: {format_metric(entry['avg_lpips'], '.4f')} | "
                   f"Enc: {entry['avg_encode_ms']:.0f}ms | "
                   f"Dec: {entry['avg_decode_ms']:.0f}ms\n")
 
@@ -549,22 +823,46 @@ def run_benchmark(
     print(f"\n{'='*70}")
     print("SUMMARY  (averaged over all quality levels and all images)")
     print(f"{'='*70}")
-    print(f"  {'Codec':<26} {'Avg BPP':<10} {'Avg PSNR':<12} "
-          f"{'Avg Enc (ms)':<16} {'Avg Dec (ms)'}")
-    print(f"  {'─'*66}")
+    print(f"  {'Codec':<22} {'Avg BPP':<10} {'Avg PSNR':<10} "
+          f"{'Avg MS-SSIM':<13} {'Avg LPIPS':<11} "
+          f"{'Avg Enc (ms)':<13} {'Avg Dec (ms)'}")
+    print(f"  {'─'*92}")
     for codec_name, pts in results.items():
         if not pts:
             continue
-        print(f"  {codec_name:<26} "
+        print(f"  {codec_name:<22} "
               f"{np.mean([p['avg_bpp']       for p in pts]):<10.4f} "
-              f"{np.mean([p['avg_psnr']      for p in pts]):<12.2f} "
-              f"{np.mean([p['avg_encode_ms'] for p in pts]):<16.1f} "
+              f"{np.mean([p['avg_psnr']      for p in pts]):<10.2f} "
+              f"{format_metric(average_or_none([p.get('avg_ms_ssim') for p in pts]), '.4f'):<13} "
+              f"{format_metric(average_or_none([p.get('avg_lpips') for p in pts]), '.4f'):<11} "
+              f"{np.mean([p['avg_encode_ms'] for p in pts]):<13.1f} "
               f"{np.mean([p['avg_decode_ms'] for p in pts]):.1f}")
 
     # ── Plots ─────────────────────────────────────────────────
     print()
-    plot_rd_curves(results, output_rd, device, source_type)
+    plot_rd_curves(results, "psnr", output_rd, device, source_type)
+    plot_rd_curves(results, "ms_ssim", output_msssim, device, source_type)
+    plot_rd_curves(results, "lpips", output_lpips, device, source_type)
     plot_runtime(results, output_rt, device)
+
+    bd_table = compute_bd_rate_table(results)
+    with open(output_bd_json, "w") as f:
+        json.dump(bd_table, f, indent=2)
+    print(f"  ✅ BD-Rate results saved → {output_bd_json}")
+    save_bd_rate_table_image(bd_table, output_bd_table)
+
+    if "bmshj2018-factorized" in bd_table:
+        print(f"\n{'='*70}")
+        print("BD-RATE VS BMSHJ2018-FACTORIZED  (matched PSNR)")
+        print(f"{'='*70}")
+        for codec_name in bd_table:
+            if codec_name == "bmshj2018-factorized":
+                continue
+            value = bd_table[codec_name].get("bmshj2018-factorized")
+            if value is None:
+                print(f"  {codec_name:<18} n/a")
+                continue
+            print(f"  {codec_name:<18} {value:+.1f}%")
 
     # ── AVIF-specific note ────────────────────────────────────
     if AVIF_AVAILABLE and "AVIF" in results:
@@ -584,26 +882,31 @@ HOW TO READ YOUR RESULTS
 {'='*70}
 
 rd_curve.png
-  X-axis = BPP   (left = smaller file)
-  Y-axis = PSNR  (up = better quality)
+  Figure 1: BPP vs PSNR
   Higher + further left = better codec
 
-  Expected ranking:
-    cheng2020 ≈ AVIF  (nearly identical — key finding)
-    mbt2018 just below
-    bmshj2018 just above WebP
-    JPEG clearly worst
+rd_msssim.png
+  Figure 2: BPP vs MS-SSIM
+  Better captures structural perceptual quality than PSNR
+
+rd_lpips.png
+  Figure 3: BPP vs LPIPS
+  Lower is better
+
+bd_rate_table.png / bd_rate_results.json
+  Figure 4: pairwise BD-Rate at matched PSNR
+  Negative means the column codec needs fewer bits than the row codec
 
 runtime_chart.png (log scale)
   JPEG/WebP:  5–150ms
   AVIF:       200–2000ms  ← slower than JPEG/WebP, faster than neural
-  Neural CPU: 3,000–60,000ms
+  Neural CPU: can be much slower than traditional codecs
   Neural GPU: 50–500ms
 
 THESIS TAKEAWAY:
-  AVIF matches neural quality AND is faster than neural on CPU
-  Neural only wins at extreme compression (< 0.15 bpp)
-  Speed advantage of traditional codecs: JPEG > WebP > AVIF > Neural
+  PSNR alone may hide perceptual differences between codecs
+  MS-SSIM and LPIPS help show whether neural compression looks better
+  BD-Rate gives you one paper-style number for the full curve
 {'='*70}
 """)
 
@@ -642,6 +945,10 @@ def main():
     )
     parser.add_argument("--output-json", type=str, default="benchmark_results.json")
     parser.add_argument("--output-rd",   type=str, default="rd_curve.png")
+    parser.add_argument("--output-msssim", type=str, default="rd_msssim.png")
+    parser.add_argument("--output-lpips", type=str, default="rd_lpips.png")
+    parser.add_argument("--output-bd-json", type=str, default="bd_rate_results.json")
+    parser.add_argument("--output-bd-table", type=str, default="bd_rate_table.png")
     parser.add_argument("--output-rt",   type=str, default="runtime_chart.png")
     args = parser.parse_args()
 
@@ -650,7 +957,7 @@ def main():
         print("   Neural models will be ~100x faster than CPU.\n")
     else:
         print("\n⚠️  No GPU — running on CPU.")
-        print("   cheng2020 takes ~60s per image on CPU.")
+        print("   LPIPS and neural compression can be slow on CPU.")
         print("   Tip: use --max-images 5 for a quick test first.\n")
 
     run_benchmark(
@@ -660,6 +967,10 @@ def main():
         source_type=args.source_type,
         output_json=args.output_json,
         output_rd=args.output_rd,
+        output_msssim=args.output_msssim,
+        output_lpips=args.output_lpips,
+        output_bd_json=args.output_bd_json,
+        output_bd_table=args.output_bd_table,
         output_rt=args.output_rt,
     )
 
