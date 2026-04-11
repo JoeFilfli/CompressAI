@@ -224,6 +224,35 @@ def collect_training_images(
 
     return image_paths
 
+
+def split_train_validation_images(
+    image_paths: List[Path],
+    val_ratio: float,
+    seed: int,
+) -> Tuple[List[Path], List[Path]]:
+    if not image_paths:
+        raise RuntimeError("Cannot split an empty image list")
+
+    if not (0.0 < val_ratio < 1.0):
+        raise RuntimeError(f"val_ratio must be between 0 and 1, got {val_ratio}")
+
+    rng = random.Random(seed)
+    shuffled = list(image_paths)
+    rng.shuffle(shuffled)
+
+    val_count = max(1, int(round(len(shuffled) * val_ratio)))
+    if val_count >= len(shuffled):
+        val_count = len(shuffled) - 1
+
+    val_images = shuffled[:val_count]
+    train_images = shuffled[val_count:]
+    if not train_images or not val_images:
+        raise RuntimeError(
+            "Validation split produced an empty train or validation partition. "
+            "Use more images or a smaller --val-ratio."
+        )
+    return train_images, val_images
+
 # ─────────────────────────────────────────────────────────────
 # DATASET
 # ─────────────────────────────────────────────────────────────
@@ -245,11 +274,14 @@ class PhotographerCropDataset(Dataset):
         crop_size: int = 256,
         seed: int = 42,
         loader_backend: str = "auto",
+        crop_mode: str = "random",
+        dataset_label: str = "Dataset",
     ):
         self.crop_size = crop_size
         self.to_tensor = transforms.ToTensor()
         self.loader_backend = loader_backend
         self.use_torchvision_decoder = loader_backend in {"auto", "torchvision"}
+        self.crop_mode = crop_mode
 
         rng = random.Random(seed)
         if not image_paths:
@@ -274,7 +306,7 @@ class PhotographerCropDataset(Dataset):
         rng.shuffle(self.samples)
 
         print(
-            f"  Dataset: {len(sampled):,} images × {crops_per_image} crops/image "
+            f"  {dataset_label}: {len(sampled):,} images × {crops_per_image} crops/image "
             f"= {len(self.samples):,} patches per epoch"
         )
 
@@ -297,13 +329,28 @@ class PhotographerCropDataset(Dataset):
         left = random.randint(0, w - self.crop_size)
         return TF.crop(x, top, left, self.crop_size, self.crop_size)
 
+    def _crop_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        if self.crop_mode == "center":
+            _, h, w = x.shape
+            if h < self.crop_size or w < self.crop_size:
+                scale = math.ceil(self.crop_size / min(h, w))
+                x = TF.resize(
+                    x,
+                    [h * scale, w * scale],
+                    interpolation=InterpolationMode.BILINEAR,
+                    antialias=True,
+                )
+            return TF.center_crop(x, [self.crop_size, self.crop_size])
+
+        return self._random_crop_tensor(x)
+
     def __getitem__(self, idx: int) -> torch.Tensor:
         img_path = self.samples[idx]
         try:
             if self.use_torchvision_decoder:
                 try:
                     x = read_image(str(img_path), mode=ImageReadMode.RGB).float().div_(255.0)
-                    return self._random_crop_tensor(x)
+                    return self._crop_tensor(x)
                 except Exception:
                     if self.loader_backend == "torchvision":
                         raise
@@ -314,7 +361,10 @@ class PhotographerCropDataset(Dataset):
             if w < self.crop_size or h < self.crop_size:
                 scale = math.ceil(self.crop_size / min(w, h))
                 img = img.resize((w * scale, h * scale), Image.BILINEAR)
-            crop = transforms.RandomCrop(self.crop_size)(img)
+            if self.crop_mode == "center":
+                crop = transforms.CenterCrop(self.crop_size)(img)
+            else:
+                crop = transforms.RandomCrop(self.crop_size)(img)
             return self.to_tensor(crop)
         except Exception:
             # Return a black patch for corrupt images so the worker doesn't crash
@@ -429,15 +479,75 @@ def train_one_epoch(
     }
 
 
+def validate_one_epoch(
+    model: nn.Module,
+    criterion: nn.Module,
+    dataloader: DataLoader,
+    timing_breakdown: bool = False,
+) -> Dict:
+    model.eval()
+    device = next(model.parameters()).device
+    device_type = getattr(device, "type", str(device))
+
+    sum_loss = sum_bpp = sum_mse = 0.0
+    n_batches = 0
+    timing_totals = {
+        "data_wait": 0.0,
+        "to_device": 0.0,
+        "forward_loss": 0.0,
+    }
+    step_start = time.perf_counter()
+
+    with torch.inference_mode():
+        for x in dataloader:
+            batch_start = time.perf_counter()
+            timing_totals["data_wait"] += batch_start - step_start
+
+            transfer_start = time.perf_counter()
+            x = x.to(device, non_blocking=(device_type == "cuda"))
+            sync_device(device_type, timing_breakdown)
+            timing_totals["to_device"] += time.perf_counter() - transfer_start
+
+            forward_start = time.perf_counter()
+            out_net = model(x)
+            out_loss = criterion(out_net, x)
+            sync_device(device_type, timing_breakdown)
+            timing_totals["forward_loss"] += time.perf_counter() - forward_start
+
+            sum_loss += out_loss["loss"].item()
+            sum_bpp += out_loss["bpp_loss"].item()
+            sum_mse += out_loss.get("mse_loss", torch.zeros(1)).item()
+            n_batches += 1
+            step_start = time.perf_counter()
+
+    if n_batches == 0:
+        raise RuntimeError("Validation dataloader produced zero batches")
+
+    if timing_breakdown:
+        print_timing_breakdown(
+            "Validation timing breakdown",
+            timing_totals,
+            count=n_batches,
+        )
+
+    return {
+        "loss": sum_loss / n_batches,
+        "bpp": sum_bpp / n_batches,
+        "mse": sum_mse / n_batches,
+        "timings": timing_totals,
+    }
+
+
 def fine_tune_quality(
     quality: int,
-    train_dir: Path,
-    all_train_images: List[Path],
+    train_images: List[Path],
+    val_images: List[Path],
     checkpoint_dir: Path,
     epochs: int,
     batch_size: int,
     n_source_images: int,
     crops_per_image: int,
+    val_crops_per_image: int,
     lr: float,
     aux_lr: float,
     device: str,
@@ -459,12 +569,14 @@ def fine_tune_quality(
     model = bmshj2018_factorized(quality=quality, pretrained=True).to(device)
 
     dataset = PhotographerCropDataset(
-        image_paths=all_train_images,
+        image_paths=train_images,
         n_source_images=n_source_images,
         crops_per_image=crops_per_image,
         crop_size=256,
         seed=seed,
         loader_backend=loader_backend,
+        crop_mode="random",
+        dataset_label="Train set",
     )
     is_cuda = str(device).startswith("cuda")
     loader_kwargs = {
@@ -480,6 +592,30 @@ def fine_tune_quality(
         loader_kwargs["prefetch_factor"] = prefetch_factor
     loader = DataLoader(**loader_kwargs)
 
+    val_source_images = min(len(val_images), n_source_images)
+    val_dataset = PhotographerCropDataset(
+        image_paths=val_images,
+        n_source_images=val_source_images,
+        crops_per_image=val_crops_per_image,
+        crop_size=256,
+        seed=seed,
+        loader_backend=loader_backend,
+        crop_mode="center",
+        dataset_label="Validation set",
+    )
+    val_loader_kwargs = {
+        "dataset": val_dataset,
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": is_cuda,
+        "drop_last": False,
+        "persistent_workers": bool(num_workers > 0),
+    }
+    if num_workers > 0:
+        val_loader_kwargs["prefetch_factor"] = prefetch_factor
+    val_loader = DataLoader(**val_loader_kwargs)
+
     criterion = RateDistortionLoss(lmbda=lmbda)
     optimizer, aux_optimizer = make_optimizers(model, lr, aux_lr)
     # ReduceLROnPlateau with patience=2 lets the LR drop if training stalls
@@ -487,7 +623,7 @@ def fine_tune_quality(
         optimizer, mode="min", factor=0.5, patience=2
     )
 
-    best_loss = float("inf")
+    best_val_loss = float("inf")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, epochs + 1):
@@ -502,28 +638,36 @@ def fine_tune_quality(
             timing_breakdown=timing_breakdown,
         )
         elapsed = time.time() - t0
-        lr_scheduler.step(metrics["loss"])
+        val_metrics = validate_one_epoch(
+            model,
+            criterion,
+            val_loader,
+            timing_breakdown=False,
+        )
+        lr_scheduler.step(val_metrics["loss"])
 
         current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"  Epoch {epoch}/{epochs}  {elapsed:.0f}s  "
-            f"Loss: {metrics['loss']:.4f}  BPP: {metrics['bpp']:.4f}  "
+            f"TrainLoss: {metrics['loss']:.4f}  ValLoss: {val_metrics['loss']:.4f}  "
+            f"TrainBPP: {metrics['bpp']:.4f}  ValBPP: {val_metrics['bpp']:.4f}  "
             f"LR: {current_lr:.1e}"
         )
 
-        if metrics["loss"] < best_loss:
-            best_loss = metrics["loss"]
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
             torch.save(
                 {
                     "quality":    quality,
                     "lmbda":      lmbda,
                     "epoch":      epoch,
-                    "best_loss":  best_loss,
+                    "best_train_loss": metrics["loss"],
+                    "best_val_loss": best_val_loss,
                     "state_dict": model.state_dict(),
                 },
                 out_path,
             )
-            print(f"  -> Best checkpoint saved: {out_path}")
+            print(f"  -> Best validation checkpoint saved: {out_path}")
 
     return out_path
 
@@ -885,8 +1029,16 @@ def main() -> None:
         help="Number of training images to sample from train-dir (default: 3000)",
     )
     parser.add_argument(
+        "--val-ratio", type=float, default=0.1,
+        help="Fraction of discovered training images to reserve for validation (default: 0.1)",
+    )
+    parser.add_argument(
         "--crops-per-image", type=int, default=5,
         help="Random crops per source image per epoch (default: 5)",
+    )
+    parser.add_argument(
+        "--val-crops-per-image", type=int, default=1,
+        help="Center crops per validation image per epoch (default: 1)",
     )
     parser.add_argument(
         "--lr", type=float, default=1e-5,
@@ -974,6 +1126,10 @@ def main() -> None:
 
     if args.prefetch_factor < 1:
         parser.error("--prefetch-factor must be >= 1")
+    if not (0.0 < args.val_ratio < 1.0):
+        parser.error("--val-ratio must be between 0 and 1")
+    if args.val_crops_per_image < 1:
+        parser.error("--val-crops-per-image must be >= 1")
 
     # ── Header ───────────────────────────────────────────────
     print("=" * 60)
@@ -989,6 +1145,7 @@ def main() -> None:
         print(f"  Persist workers:{' yes' if args.num_workers > 0 else ' n/a'}")
         print(f"  Manifest cache: {args.image_manifest or _default_manifest_path(args.train_dir)}")
         print(f"  Source images:  {args.n_source_images:,}")
+        print(f"  Validation:     {args.val_ratio:.0%} split  {args.val_crops_per_image} crop/image")
         print(f"  Crops/image:    {args.crops_per_image}")
         print(f"  Epochs:         {args.epochs}")
         print(f"  LR:             {args.lr:.0e}  Aux LR: {args.aux_lr:.0e}")
@@ -1014,7 +1171,8 @@ def main() -> None:
 
     # ── Fine-tuning loop ─────────────────────────────────────
     finetuned_checkpoints: Dict[int, Path] = {}
-    all_train_images: List[Path] = []
+    train_images: List[Path] = []
+    val_images: List[Path] = []
 
     if args.eval_only:
         print("\n  --eval-only: loading existing checkpoints...")
@@ -1027,21 +1185,31 @@ def main() -> None:
                 print(f"  Found q={q} checkpoint: {ckpt}")
     else:
         print()
-        all_train_images = collect_training_images(
+        all_images = collect_training_images(
             args.train_dir,
             manifest_path=args.image_manifest,
             refresh_manifest=args.refresh_image_manifest,
         )
+        train_images, val_images = split_train_validation_images(
+            all_images,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+        )
+        print(
+            f"  Train/val split: {len(train_images):,} train images, "
+            f"{len(val_images):,} validation images"
+        )
         for q in args.qualities:
             ckpt_path = fine_tune_quality(
                 quality=q,
-                train_dir=args.train_dir,
-                all_train_images=all_train_images,
+                train_images=train_images,
+                val_images=val_images,
                 checkpoint_dir=args.checkpoint_dir,
                 epochs=args.epochs,
                 batch_size=args.batch_size,
                 n_source_images=args.n_source_images,
                 crops_per_image=args.crops_per_image,
+                val_crops_per_image=args.val_crops_per_image,
                 lr=args.lr,
                 aux_lr=args.aux_lr,
                 device=args.device,
@@ -1136,7 +1304,9 @@ def main() -> None:
             "aux_lr":          args.aux_lr,
             "train_dir":       str(args.train_dir) if args.train_dir is not None else None,
             "n_source_images": args.n_source_images,
+            "val_ratio":       args.val_ratio,
             "crops_per_image": args.crops_per_image,
+            "val_crops_per_image": args.val_crops_per_image,
             "num_workers":     args.num_workers,
             "prefetch_factor": args.prefetch_factor,
             "loader_backend":  args.loader_backend,
