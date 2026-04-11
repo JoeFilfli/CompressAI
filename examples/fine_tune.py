@@ -132,6 +132,36 @@ LINESTYLES = {
     "AVIF":        ":",
 }
 
+
+def sync_device(device: str, enabled: bool = True) -> None:
+    """Synchronize CUDA for more accurate timing when requested."""
+    if enabled and str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def format_seconds(seconds: float) -> str:
+    return f"{seconds:.2f}s"
+
+
+def print_timing_breakdown(
+    title: str,
+    timings: Dict[str, float],
+    *,
+    count: Optional[int] = None,
+) -> None:
+    total = sum(timings.values())
+    print(f"  {title}")
+    if total <= 0:
+        print("    No timing data collected")
+        return
+
+    for label, seconds in sorted(timings.items(), key=lambda kv: kv[1], reverse=True):
+        pct = (seconds / total) * 100 if total > 0 else 0.0
+        extra = f" | avg {seconds / count:.4f}s" if count else ""
+        print(f"    {label:<20} {format_seconds(seconds):>8} | {pct:5.1f}%{extra}")
+
+    print(f"    {'Total':<20} {format_seconds(total):>8}")
+
 # ─────────────────────────────────────────────────────────────
 # DATASET
 # ─────────────────────────────────────────────────────────────
@@ -157,6 +187,7 @@ class PhotographerCropDataset(Dataset):
         self.to_tensor = transforms.ToTensor()
 
         rng = random.Random(seed)
+        scan_start = time.perf_counter()
 
         print(f"  Scanning {root} for images...", flush=True)
         all_images = [
@@ -170,6 +201,7 @@ class PhotographerCropDataset(Dataset):
             )
 
         print(f"  Found {len(all_images):,} total images")
+        print(f"  Scan time: {format_seconds(time.perf_counter() - scan_start)}")
 
         if len(all_images) > n_source_images:
             sampled = rng.sample(all_images, n_source_images)
@@ -233,31 +265,57 @@ def train_one_epoch(
     aux_optimizer: optim.Optimizer,
     epoch: int,
     clip_max_norm: float = 1.0,
+    timing_breakdown: bool = False,
 ) -> Dict:
     model.train()
     device = next(model.parameters()).device
+    device_type = getattr(device, "type", str(device))
 
     sum_loss = sum_bpp = sum_mse = 0.0
     n_batches = 0
+    timing_totals = {
+        "data_wait": 0.0,
+        "to_device": 0.0,
+        "forward_loss": 0.0,
+        "main_backward_step": 0.0,
+        "aux_backward_step": 0.0,
+    }
+    step_start = time.perf_counter()
 
     for i, x in enumerate(dataloader):
-        x = x.to(device)
+        batch_start = time.perf_counter()
+        timing_totals["data_wait"] += batch_start - step_start
+
+        transfer_start = time.perf_counter()
+        x = x.to(device, non_blocking=(device_type == "cuda"))
+        sync_device(device_type, timing_breakdown)
+        timing_totals["to_device"] += time.perf_counter() - transfer_start
 
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
+        forward_start = time.perf_counter()
         out_net = model(x)
         out_loss = criterion(out_net, x)
+        sync_device(device_type, timing_breakdown)
+        timing_totals["forward_loss"] += time.perf_counter() - forward_start
+
+        main_step_start = time.perf_counter()
         out_loss["loss"].backward()
 
         if clip_max_norm > 0:
             nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
 
         optimizer.step()
+        sync_device(device_type, timing_breakdown)
+        timing_totals["main_backward_step"] += time.perf_counter() - main_step_start
 
+        aux_step_start = time.perf_counter()
         aux_loss = model.aux_loss()
         aux_loss.backward()
         aux_optimizer.step()
+        sync_device(device_type, timing_breakdown)
+        timing_totals["aux_backward_step"] += time.perf_counter() - aux_step_start
 
         sum_loss += out_loss["loss"].item()
         sum_bpp  += out_loss["bpp_loss"].item()
@@ -275,10 +333,20 @@ def train_one_epoch(
                 flush=True,
             )
 
+        step_start = time.perf_counter()
+
+    if timing_breakdown and n_batches:
+        print_timing_breakdown(
+            f"Epoch {epoch} timing breakdown ({n_batches} batches)",
+            timing_totals,
+            count=n_batches,
+        )
+
     return {
         "loss": sum_loss / n_batches,
         "bpp":  sum_bpp  / n_batches,
         "mse":  sum_mse  / n_batches,
+        "timings": timing_totals,
     }
 
 
@@ -295,6 +363,7 @@ def fine_tune_quality(
     device: str,
     num_workers: int,
     seed: int,
+    timing_breakdown: bool = False,
 ) -> Path:
     """Fine-tune bmshj2018-factorized at one quality level. Returns checkpoint path."""
 
@@ -336,7 +405,13 @@ def fine_tune_quality(
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         metrics = train_one_epoch(
-            model, criterion, loader, optimizer, aux_optimizer, epoch
+            model,
+            criterion,
+            loader,
+            optimizer,
+            aux_optimizer,
+            epoch,
+            timing_breakdown=timing_breakdown,
         )
         elapsed = time.time() - t0
         lr_scheduler.step(metrics["loss"])
@@ -377,6 +452,7 @@ def evaluate_neural(
     model: nn.Module,
     images: List[Path],
     device: str,
+    timing_breakdown: bool = False,
 ) -> Dict:
     """Compress each test image with a neural model; return averaged metrics."""
     model.eval()
@@ -385,16 +461,29 @@ def evaluate_neural(
     bpps: List[float] = []
     psnrs: List[float] = []
     ms_ssims: List[float] = []
+    timing_totals = {
+        "load_to_tensor": 0.0,
+        "pad": 0.0,
+        "compress_decompress": 0.0,
+        "metrics": 0.0,
+    }
 
     for i, img_path in enumerate(images, 1):
         try:
+            load_start = time.perf_counter()
             img = Image.open(img_path).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
             h, w = x.shape[2], x.shape[3]
+            sync_device(device, timing_breakdown)
+            timing_totals["load_to_tensor"] += time.perf_counter() - load_start
 
+            pad_start = time.perf_counter()
             pad, unpad = compute_padding(h, w, min_div=64)
             x_padded = F.pad(x, pad)
+            sync_device(device, timing_breakdown)
+            timing_totals["pad"] += time.perf_counter() - pad_start
 
+            codec_start = time.perf_counter()
             with torch.inference_mode():
                 out_enc = model.compress(x_padded)
                 compressed_bytes = sum(
@@ -402,7 +491,10 @@ def evaluate_neural(
                 )
                 out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
                 x_hat = F.pad(out_dec["x_hat"], unpad).clamp(0, 1)
+            sync_device(device, timing_breakdown)
+            timing_totals["compress_decompress"] += time.perf_counter() - codec_start
 
+            metrics_start = time.perf_counter()
             bpp  = (compressed_bytes * 8) / (h * w)
             mse  = F.mse_loss(x.cpu(), x_hat.cpu()).item()
             psnr = psnr_from_mse(mse)
@@ -412,6 +504,7 @@ def evaluate_neural(
             if MSSSIM_AVAILABLE:
                 ms_val = compute_msssim(x.cpu(), x_hat.cpu(), data_range=1.0).item()
                 ms_ssims.append(float(ms_val))
+            timing_totals["metrics"] += time.perf_counter() - metrics_start
 
             print(
                 f"    [{i:2d}/{len(images)}] {img_path.name} | "
@@ -424,14 +517,22 @@ def evaluate_neural(
     if not bpps:
         return {"avg_bpp": None, "avg_psnr": None, "avg_ms_ssim": None}
 
+    if timing_breakdown:
+        print_timing_breakdown(
+            f"Neural evaluation timing ({len(bpps)} images)",
+            timing_totals,
+            count=len(bpps),
+        )
+
     return {
         "avg_bpp":     round(float(np.mean(bpps)),     4),
         "avg_psnr":    round(float(np.mean(psnrs)),    2),
         "avg_ms_ssim": round(float(np.mean(ms_ssims)), 4) if ms_ssims else None,
+        "timings": timing_totals,
     }
 
 
-def run_avif_curve(images: List[Path]) -> List[Dict]:
+def run_avif_curve(images: List[Path], timing_breakdown: bool = False) -> List[Dict]:
     """Evaluate AVIF across all quality levels; return one dict per quality."""
     if not AVIF_AVAILABLE:
         print("  AVIF not available — skipping traditional baseline")
@@ -439,18 +540,32 @@ def run_avif_curve(images: List[Path]) -> List[Dict]:
 
     print(f"\n  AVIF baseline ({len(AVIF_QUALITIES)} quality levels)...")
     entries = []
+    total_timing = {
+        "load_to_tensor": 0.0,
+        "encode_decode": 0.0,
+        "metrics": 0.0,
+    }
+    total_images = 0
 
     for q in AVIF_QUALITIES:
         bpps: List[float] = []
         psnrs: List[float] = []
         ms_ssims: List[float] = []
+        quality_timing = {
+            "load_to_tensor": 0.0,
+            "encode_decode": 0.0,
+            "metrics": 0.0,
+        }
 
         for img_path in images:
             try:
+                load_start = time.perf_counter()
                 img = Image.open(img_path).convert("RGB")
                 h, w = img.size[1], img.size[0]
                 original = transforms.ToTensor()(img).unsqueeze(0)
+                quality_timing["load_to_tensor"] += time.perf_counter() - load_start
 
+                codec_start = time.perf_counter()
                 buf = io.BytesIO()
                 img.save(buf, format="AVIF", quality=q)
                 compressed_bytes = buf.tell()
@@ -458,7 +573,9 @@ def run_avif_curve(images: List[Path]) -> List[Dict]:
 
                 reconstructed_img = Image.open(buf).convert("RGB")
                 x_hat = transforms.ToTensor()(reconstructed_img).unsqueeze(0)
+                quality_timing["encode_decode"] += time.perf_counter() - codec_start
 
+                metrics_start = time.perf_counter()
                 bpp  = (compressed_bytes * 8) / (h * w)
                 mse  = F.mse_loss(original, x_hat).item()
                 bpps.append(bpp)
@@ -468,6 +585,7 @@ def run_avif_curve(images: List[Path]) -> List[Dict]:
                     ms_ssims.append(
                         float(compute_msssim(original, x_hat, data_range=1.0).item())
                     )
+                quality_timing["metrics"] += time.perf_counter() - metrics_start
             except Exception as e:
                 print(f"    {img_path.name} AVIF q={q} failed: {e}")
 
@@ -479,11 +597,28 @@ def run_avif_curve(images: List[Path]) -> List[Dict]:
             "avg_bpp":     round(float(np.mean(bpps)),     4),
             "avg_psnr":    round(float(np.mean(psnrs)),    2),
             "avg_ms_ssim": round(float(np.mean(ms_ssims)), 4) if ms_ssims else None,
+            "timings":     quality_timing,
         }
         entries.append(entry)
+        total_images += len(bpps)
+        for key, value in quality_timing.items():
+            total_timing[key] += value
         print(
             f"    q={q:3d} | BPP: {entry['avg_bpp']:.4f} | "
             f"PSNR: {entry['avg_psnr']:.2f} dB"
+        )
+        if timing_breakdown:
+            print_timing_breakdown(
+                f"AVIF timing for q={q}",
+                quality_timing,
+                count=len(bpps),
+            )
+
+    if timing_breakdown and total_images:
+        print_timing_breakdown(
+            "AVIF timing breakdown (all qualities)",
+            total_timing,
+            count=total_images,
         )
 
     return entries
@@ -707,6 +842,10 @@ def main() -> None:
         "--seed", type=int, default=42,
         help="Random seed for dataset sampling (default: 42)",
     )
+    parser.add_argument(
+        "--timing-breakdown", action="store_true",
+        help="Print detailed timing summaries to help identify bottlenecks",
+    )
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -784,6 +923,7 @@ def main() -> None:
                 device=args.device,
                 num_workers=args.num_workers,
                 seed=args.seed,
+                timing_breakdown=args.timing_breakdown,
             )
             finetuned_checkpoints[q] = ckpt_path
             if args.device == "cuda":
@@ -803,7 +943,12 @@ def main() -> None:
         pretrained_model = bmshj2018_factorized(
             quality=q, pretrained=True
         ).eval().to(args.device)
-        pretrained_metrics = evaluate_neural(pretrained_model, test_images, args.device)
+        pretrained_metrics = evaluate_neural(
+            pretrained_model,
+            test_images,
+            args.device,
+            timing_breakdown=args.timing_breakdown,
+        )
         pretrained_metrics["quality"] = q
         pretrained_results.append(pretrained_metrics)
         print(
@@ -827,7 +972,12 @@ def main() -> None:
         finetuned_model.load_state_dict(ckpt["state_dict"])
         finetuned_model.eval()
 
-        finetuned_metrics = evaluate_neural(finetuned_model, test_images, args.device)
+        finetuned_metrics = evaluate_neural(
+            finetuned_model,
+            test_images,
+            args.device,
+            timing_breakdown=args.timing_breakdown,
+        )
         finetuned_metrics["quality"] = q
         finetuned_results.append(finetuned_metrics)
 
@@ -843,7 +993,10 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     # ── AVIF baseline ────────────────────────────────────────
-    avif_entries = run_avif_curve(test_images)
+    avif_entries = run_avif_curve(
+        test_images,
+        timing_breakdown=args.timing_breakdown,
+    )
 
     # ── Save results JSON ────────────────────────────────────
     all_results = {
