@@ -33,6 +33,10 @@ Usage:
     python fine_tune.py --train-dir /path/to/my_images --test-dir ./portrait_test_images \\
         --device cuda --epochs 15 --n-source-images 5000 --batch-size 16
 
+    # PNG-heavy dataset with faster tensor decoding and persistent workers:
+    python fine_tune.py --train-dir /path/to/png_dataset --test-dir ./portrait_test_images \\
+        --loader-backend torchvision --num-workers 8 --prefetch-factor 4
+
     # Skip training, just evaluate existing checkpoints:
     python fine_tune.py --test-dir ./portrait_test_images --eval-only
 
@@ -60,6 +64,9 @@ import torch.optim as optim
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from torchvision.io import ImageReadMode, read_image
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 
 from compressai.losses import RateDistortionLoss
 from compressai.ops import compute_padding
@@ -162,6 +169,61 @@ def print_timing_breakdown(
 
     print(f"    {'Total':<20} {format_seconds(total):>8}")
 
+
+def _default_manifest_path(root: Path) -> Path:
+    return root / ".fine_tune_image_manifest.json"
+
+
+def collect_training_images(
+    root: Path,
+    manifest_path: Optional[Path] = None,
+    refresh_manifest: bool = False,
+) -> List[Path]:
+    manifest = manifest_path or _default_manifest_path(root)
+
+    if not refresh_manifest and manifest.exists():
+        try:
+            with manifest.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+            cached_root = payload.get("root")
+            cached_paths = payload.get("paths")
+            if cached_root == str(root.resolve()) and isinstance(cached_paths, list):
+                image_paths = [Path(p) for p in cached_paths if Path(p).exists()]
+                if image_paths:
+                    print(f"  Loaded {len(image_paths):,} image paths from manifest cache")
+                    return image_paths
+        except Exception:
+            pass
+
+    scan_start = time.perf_counter()
+    print(f"  Scanning {root} for images...", flush=True)
+    image_paths = sorted(
+        p for p in root.rglob("*")
+        if p.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
+    if not image_paths:
+        raise RuntimeError(
+            f"No images found in {root}. "
+            f"Supported: {sorted(SUPPORTED_EXTENSIONS)}"
+        )
+
+    print(f"  Found {len(image_paths):,} total images")
+    print(f"  Scan time: {format_seconds(time.perf_counter() - scan_start)}")
+
+    try:
+        with manifest.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "root": str(root.resolve()),
+                    "paths": [str(p) for p in image_paths],
+                },
+                f,
+            )
+    except Exception:
+        pass
+
+    return image_paths
+
 # ─────────────────────────────────────────────────────────────
 # DATASET
 # ─────────────────────────────────────────────────────────────
@@ -177,36 +239,29 @@ class PhotographerCropDataset(Dataset):
 
     def __init__(
         self,
-        root: Path,
+        image_paths: List[Path],
         n_source_images: int = 3000,
         crops_per_image: int = 5,
         crop_size: int = 256,
         seed: int = 42,
+        loader_backend: str = "auto",
     ):
         self.crop_size = crop_size
         self.to_tensor = transforms.ToTensor()
+        self.loader_backend = loader_backend
+        self.use_torchvision_decoder = loader_backend in {"auto", "torchvision"}
 
         rng = random.Random(seed)
-        scan_start = time.perf_counter()
-
-        print(f"  Scanning {root} for images...", flush=True)
-        all_images = [
-            p for p in root.rglob("*")
-            if p.suffix.lower() in SUPPORTED_EXTENSIONS
-        ]
-        if not all_images:
+        if not image_paths:
             raise RuntimeError(
-                f"No images found in {root}. "
+                "No images provided to PhotographerCropDataset. "
                 f"Supported: {sorted(SUPPORTED_EXTENSIONS)}"
             )
 
-        print(f"  Found {len(all_images):,} total images")
-        print(f"  Scan time: {format_seconds(time.perf_counter() - scan_start)}")
-
-        if len(all_images) > n_source_images:
-            sampled = rng.sample(all_images, n_source_images)
+        if len(image_paths) > n_source_images:
+            sampled = rng.sample(image_paths, n_source_images)
         else:
-            sampled = list(all_images)
+            sampled = list(image_paths)
             if len(sampled) < n_source_images:
                 print(
                     f"  Warning: only {len(sampled):,} images available "
@@ -226,9 +281,33 @@ class PhotographerCropDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _random_crop_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        _, h, w = x.shape
+        if h < self.crop_size or w < self.crop_size:
+            scale = math.ceil(self.crop_size / min(h, w))
+            x = TF.resize(
+                x,
+                [h * scale, w * scale],
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            _, h, w = x.shape
+
+        top = random.randint(0, h - self.crop_size)
+        left = random.randint(0, w - self.crop_size)
+        return TF.crop(x, top, left, self.crop_size, self.crop_size)
+
     def __getitem__(self, idx: int) -> torch.Tensor:
         img_path = self.samples[idx]
         try:
+            if self.use_torchvision_decoder:
+                try:
+                    x = read_image(str(img_path), mode=ImageReadMode.RGB).float().div_(255.0)
+                    return self._random_crop_tensor(x)
+                except Exception:
+                    if self.loader_backend == "torchvision":
+                        raise
+
             img = Image.open(img_path).convert("RGB")
             w, h = img.size
             # Upscale tiny images rather than skipping them
@@ -353,6 +432,7 @@ def train_one_epoch(
 def fine_tune_quality(
     quality: int,
     train_dir: Path,
+    all_train_images: List[Path],
     checkpoint_dir: Path,
     epochs: int,
     batch_size: int,
@@ -362,6 +442,8 @@ def fine_tune_quality(
     aux_lr: float,
     device: str,
     num_workers: int,
+    prefetch_factor: int,
+    loader_backend: str,
     seed: int,
     timing_breakdown: bool = False,
 ) -> Path:
@@ -377,20 +459,26 @@ def fine_tune_quality(
     model = bmshj2018_factorized(quality=quality, pretrained=True).to(device)
 
     dataset = PhotographerCropDataset(
-        root=train_dir,
+        image_paths=all_train_images,
         n_source_images=n_source_images,
         crops_per_image=crops_per_image,
         crop_size=256,
         seed=seed,
+        loader_backend=loader_backend,
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=(device == "cuda"),
-        drop_last=True,
-    )
+    is_cuda = str(device).startswith("cuda")
+    loader_kwargs = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": True,
+        "num_workers": num_workers,
+        "pin_memory": is_cuda,
+        "drop_last": True,
+        "persistent_workers": bool(num_workers > 0),
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    loader = DataLoader(**loader_kwargs)
 
     criterion = RateDistortionLoss(lmbda=lmbda)
     optimizer, aux_optimizer = make_optimizers(model, lr, aux_lr)
@@ -818,6 +906,27 @@ def main() -> None:
         help="DataLoader worker processes (default: 4)",
     )
     parser.add_argument(
+        "--prefetch-factor", type=int, default=4,
+        help="Prefetch batches per worker when num_workers > 0 (default: 4)",
+    )
+    parser.add_argument(
+        "--loader-backend",
+        choices=["auto", "torchvision", "pil"],
+        default="auto",
+        help=(
+            "Training image decoder backend. "
+            "'auto' prefers torchvision tensor decode and falls back to PIL."
+        ),
+    )
+    parser.add_argument(
+        "--image-manifest", type=Path, default=None,
+        help="Optional JSON cache file for the recursively discovered training image list",
+    )
+    parser.add_argument(
+        "--refresh-image-manifest", action="store_true",
+        help="Force a rescan of --train-dir instead of reusing the cached image manifest",
+    )
+    parser.add_argument(
         "--checkpoint-dir", type=Path,
         default=EXAMPLES_DIR / "fine_tune_checkpoints",
         help="Directory to save/load model checkpoints",
@@ -863,6 +972,9 @@ def main() -> None:
     if not args.eval_only and not args.train_dir.exists():
         parser.error(f"--train-dir does not exist: {args.train_dir}")
 
+    if args.prefetch_factor < 1:
+        parser.error("--prefetch-factor must be >= 1")
+
     # ── Header ───────────────────────────────────────────────
     print("=" * 60)
     print("PATH C — DOMAIN ADAPTATION VIA FINE-TUNING")
@@ -872,6 +984,10 @@ def main() -> None:
     print(f"  Device:         {args.device.upper()}")
     if not args.eval_only:
         print(f"  Train dir:      {args.train_dir}")
+        print(f"  Loader backend: {args.loader_backend}")
+        print(f"  Workers:        {args.num_workers}  Prefetch: {args.prefetch_factor}")
+        print(f"  Persist workers:{' yes' if args.num_workers > 0 else ' n/a'}")
+        print(f"  Manifest cache: {args.image_manifest or _default_manifest_path(args.train_dir)}")
         print(f"  Source images:  {args.n_source_images:,}")
         print(f"  Crops/image:    {args.crops_per_image}")
         print(f"  Epochs:         {args.epochs}")
@@ -898,6 +1014,7 @@ def main() -> None:
 
     # ── Fine-tuning loop ─────────────────────────────────────
     finetuned_checkpoints: Dict[int, Path] = {}
+    all_train_images: List[Path] = []
 
     if args.eval_only:
         print("\n  --eval-only: loading existing checkpoints...")
@@ -909,10 +1026,17 @@ def main() -> None:
                 finetuned_checkpoints[q] = ckpt
                 print(f"  Found q={q} checkpoint: {ckpt}")
     else:
+        print()
+        all_train_images = collect_training_images(
+            args.train_dir,
+            manifest_path=args.image_manifest,
+            refresh_manifest=args.refresh_image_manifest,
+        )
         for q in args.qualities:
             ckpt_path = fine_tune_quality(
                 quality=q,
                 train_dir=args.train_dir,
+                all_train_images=all_train_images,
                 checkpoint_dir=args.checkpoint_dir,
                 epochs=args.epochs,
                 batch_size=args.batch_size,
@@ -922,11 +1046,13 @@ def main() -> None:
                 aux_lr=args.aux_lr,
                 device=args.device,
                 num_workers=args.num_workers,
+                prefetch_factor=args.prefetch_factor,
+                loader_backend=args.loader_backend,
                 seed=args.seed,
                 timing_breakdown=args.timing_breakdown,
             )
             finetuned_checkpoints[q] = ckpt_path
-            if args.device == "cuda":
+            if str(args.device).startswith("cuda"):
                 torch.cuda.empty_cache()
 
     # ── Evaluate both pretrained and fine-tuned ──────────────
@@ -956,7 +1082,7 @@ def main() -> None:
             f"PSNR={pretrained_metrics['avg_psnr']:.2f} dB"
         )
         del pretrained_model
-        if args.device == "cuda":
+        if str(args.device).startswith("cuda"):
             torch.cuda.empty_cache()
 
         # Fine-tuned model
@@ -989,7 +1115,7 @@ def main() -> None:
             f"(ΔPSNR={delta_psnr:+.2f} dB  ΔBPP={delta_bpp:+.4f})"
         )
         del finetuned_model
-        if args.device == "cuda":
+        if str(args.device).startswith("cuda"):
             torch.cuda.empty_cache()
 
     # ── AVIF baseline ────────────────────────────────────────
@@ -1008,8 +1134,13 @@ def main() -> None:
             "epochs":          args.epochs,
             "lr":              args.lr,
             "aux_lr":          args.aux_lr,
+            "train_dir":       str(args.train_dir) if args.train_dir is not None else None,
             "n_source_images": args.n_source_images,
             "crops_per_image": args.crops_per_image,
+            "num_workers":     args.num_workers,
+            "prefetch_factor": args.prefetch_factor,
+            "loader_backend":  args.loader_backend,
+            "image_manifest":  str(args.image_manifest) if args.image_manifest is not None else str(_default_manifest_path(args.train_dir)) if args.train_dir is not None else None,
             "n_test_images":   len(test_images),
             "device":          args.device,
         },
