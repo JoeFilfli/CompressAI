@@ -1,7 +1,8 @@
 """
-Fine-Tune bmshj2018-factorized on Photographer Images (Path C — Domain Adaptation)
+Fine-Tune pretrained image compression models on Photographer Images
+(Path C — Domain Adaptation)
 
-The pretrained bmshj2018-factorized model was trained on general-purpose images
+The pretrained model was trained on general-purpose images
 (ImageNet, CLIC). Photographer images have a specific statistical distribution —
 colour profiles, bokeh blur, skin tones, HDR — that the model has never specialised
 for. Fine-tuning continues training on photographer-specific images, nudging the
@@ -28,6 +29,10 @@ Usage:
     # Quick sanity check (few epochs, few images):
     python fine_tune.py --train-dir /path/to/my_images --test-dir ./portrait_test_images \\
         --epochs 2 --n-source-images 200 --crops-per-image 3
+
+    # Fine-tune mbt2018 instead of the default bmshj2018-factorized:
+    python fine_tune.py --model mbt2018 --train-dir /path/to/my_images \\
+        --test-dir ./portrait_test_images
 
     # GPU run with more training data:
     python fine_tune.py --train-dir /path/to/my_images --test-dir ./portrait_test_images \\
@@ -71,7 +76,7 @@ from torchvision.transforms import functional as TF
 from compressai.losses import RateDistortionLoss
 from compressai.ops import compute_padding
 from compressai.optimizers import net_aux_optimizer
-from compressai.zoo import bmshj2018_factorized
+from compressai.zoo import image_models
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -107,8 +112,9 @@ EXAMPLES_DIR = Path(__file__).resolve().parent
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 
-# Lambda values that match each pretrained bmshj2018-factorized quality level.
-# Using the same lambda during fine-tuning preserves the rate-distortion operating point.
+# Lambda values that match the standard MSE quality levels used by the supported
+# pretrained models. Using the same lambda during fine-tuning preserves the
+# original rate-distortion operating point.
 QUALITY_LAMBDA_MAP = {
     1: 0.0018,
     2: 0.0035,
@@ -138,6 +144,48 @@ LINESTYLES = {
     "Fine-tuned":  "-",
     "AVIF":        ":",
 }
+
+SUPPORTED_MODELS = {
+    "bmshj2018-factorized",
+    "mbt2018",
+}
+
+
+def checkpoint_name(model_name: str, quality: int) -> str:
+    return f"{model_name}_q{quality}_finetuned.pth"
+
+
+def legacy_checkpoint_name(quality: int) -> str:
+    return f"q{quality}_finetuned.pth"
+
+
+def default_output_json_name(model_name: str) -> str:
+    return f"{model_name}_fine_tune_results.json"
+
+
+def default_output_rd_name(model_name: str) -> str:
+    return f"{model_name}_fine_tune_rd.png"
+
+
+def build_model(model_name: str, quality: int, pretrained: bool) -> nn.Module:
+    try:
+        factory = image_models[model_name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported model: {model_name}") from exc
+    return factory(quality=quality, pretrained=pretrained)
+
+
+def resolve_checkpoint_path(checkpoint_dir: Path, model_name: str, quality: int) -> Optional[Path]:
+    primary = checkpoint_dir / checkpoint_name(model_name, quality)
+    if primary.exists():
+        return primary
+
+    if model_name == "bmshj2018-factorized":
+        legacy = checkpoint_dir / legacy_checkpoint_name(quality)
+        if legacy.exists():
+            return legacy
+
+    return None
 
 
 def sync_device(device: str, enabled: bool = True) -> None:
@@ -539,6 +587,7 @@ def validate_one_epoch(
 
 
 def fine_tune_quality(
+    model_name: str,
     quality: int,
     train_images: List[Path],
     val_images: List[Path],
@@ -557,16 +606,16 @@ def fine_tune_quality(
     seed: int,
     timing_breakdown: bool = False,
 ) -> Path:
-    """Fine-tune bmshj2018-factorized at one quality level. Returns checkpoint path."""
+    """Fine-tune one pretrained model at one quality level. Returns checkpoint path."""
 
     lmbda = QUALITY_LAMBDA_MAP[quality]
-    out_path = checkpoint_dir / f"q{quality}_finetuned.pth"
+    out_path = checkpoint_dir / checkpoint_name(model_name, quality)
 
     print(f"\n{'='*60}")
-    print(f"  Fine-tuning  quality={quality}  λ={lmbda}  LR={lr:.0e}")
+    print(f"  Fine-tuning  model={model_name}  quality={quality}  λ={lmbda}  LR={lr:.0e}")
     print(f"{'='*60}")
 
-    model = bmshj2018_factorized(quality=quality, pretrained=True).to(device)
+    model = build_model(model_name, quality, pretrained=True).to(device)
 
     dataset = PhotographerCropDataset(
         image_paths=train_images,
@@ -658,6 +707,7 @@ def fine_tune_quality(
             best_val_loss = val_metrics["loss"]
             torch.save(
                 {
+                    "model_name": model_name,
                     "quality":    quality,
                     "lmbda":      lmbda,
                     "epoch":      epoch,
@@ -907,6 +957,7 @@ def bd_rate(
 # ─────────────────────────────────────────────────────────────
 
 def plot_rd_curves(
+    model_name: str,
     neural_results: Dict[str, List[Dict]],
     avif_entries: List[Dict],
     output_path: str,
@@ -950,7 +1001,7 @@ def plot_rd_curves(
     ax_psnr.set_ylabel("PSNR [dB]", fontsize=12)
     ax_psnr.set_title(
         "Rate-Distortion: BPP vs PSNR\n"
-        "bmshj2018-factorized — Pretrained vs Fine-tuned vs AVIF",
+        f"{model_name} — Pretrained vs Fine-tuned vs AVIF",
         fontsize=11,
     )
     ax_psnr.legend(fontsize=11)
@@ -968,7 +1019,7 @@ def plot_rd_curves(
         ax_ms.set_ylabel("MS-SSIM [higher is better]", fontsize=12)
         ax_ms.set_title(
             "Rate-Distortion: BPP vs MS-SSIM\n"
-            "bmshj2018-factorized — Pretrained vs Fine-tuned vs AVIF",
+            f"{model_name} — Pretrained vs Fine-tuned vs AVIF",
             fontsize=11,
         )
         ax_ms.legend(fontsize=11)
@@ -1000,7 +1051,14 @@ def collect_test_images(test_dir: Path, max_images: Optional[int] = None) -> Lis
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fine-tune bmshj2018-factorized for photographer images (Path C)"
+        description="Fine-tune a pretrained image compression model for photographer images (Path C)"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="bmshj2018-factorized",
+        choices=sorted(SUPPORTED_MODELS),
+        help="Pretrained model to fine-tune (default: bmshj2018-factorized)",
     )
     parser.add_argument(
         "--train-dir", type=Path, default=None,
@@ -1084,12 +1142,12 @@ def main() -> None:
         help="Directory to save/load model checkpoints",
     )
     parser.add_argument(
-        "--output-json", type=str, default="fine_tune_results.json",
-        help="Path for raw evaluation results JSON",
+        "--output-json", type=str, default=None,
+        help="Path for raw evaluation results JSON (default: <model>_fine_tune_results.json)",
     )
     parser.add_argument(
-        "--output-rd", type=str, default="fine_tune_rd.png",
-        help="Path for the R-D curve comparison plot",
+        "--output-rd", type=str, default=None,
+        help="Path for the R-D curve comparison plot (default: <model>_fine_tune_rd.png)",
     )
     parser.add_argument(
         "--eval-only", action="store_true",
@@ -1114,6 +1172,11 @@ def main() -> None:
         random.seed(args.seed)
         np.random.seed(args.seed)
 
+    if args.output_json is None:
+        args.output_json = default_output_json_name(args.model)
+    if args.output_rd is None:
+        args.output_rd = default_output_rd_name(args.model)
+
     # ── Validate arguments ───────────────────────────────────
     if not args.eval_only and args.train_dir is None:
         parser.error("--train-dir is required unless --eval-only is set")
@@ -1135,7 +1198,7 @@ def main() -> None:
     print("=" * 60)
     print("PATH C — DOMAIN ADAPTATION VIA FINE-TUNING")
     print("=" * 60)
-    print(f"  Model:          bmshj2018-factorized")
+    print(f"  Model:          {args.model}")
     print(f"  Qualities:      {args.qualities}")
     print(f"  Device:         {args.device.upper()}")
     if not args.eval_only:
@@ -1177,9 +1240,10 @@ def main() -> None:
     if args.eval_only:
         print("\n  --eval-only: loading existing checkpoints...")
         for q in args.qualities:
-            ckpt = args.checkpoint_dir / f"q{q}_finetuned.pth"
-            if not ckpt.exists():
-                print(f"  Warning: no checkpoint found for quality {q} at {ckpt}")
+            ckpt = resolve_checkpoint_path(args.checkpoint_dir, args.model, q)
+            if ckpt is None:
+                expected = args.checkpoint_dir / checkpoint_name(args.model, q)
+                print(f"  Warning: no checkpoint found for quality {q} at {expected}")
             else:
                 finetuned_checkpoints[q] = ckpt
                 print(f"  Found q={q} checkpoint: {ckpt}")
@@ -1201,6 +1265,7 @@ def main() -> None:
         )
         for q in args.qualities:
             ckpt_path = fine_tune_quality(
+                model_name=args.model,
                 quality=q,
                 train_images=train_images,
                 val_images=val_images,
@@ -1234,9 +1299,7 @@ def main() -> None:
         print(f"\n{'─'*50}")
         print(f"  Evaluating PRETRAINED quality={q}...")
         print(f"{'─'*50}")
-        pretrained_model = bmshj2018_factorized(
-            quality=q, pretrained=True
-        ).eval().to(args.device)
+        pretrained_model = build_model(args.model, q, pretrained=True).eval().to(args.device)
         pretrained_metrics = evaluate_neural(
             pretrained_model,
             test_images,
@@ -1261,7 +1324,7 @@ def main() -> None:
         print(f"\n{'─'*50}")
         print(f"  Evaluating FINE-TUNED quality={q}...")
         print(f"{'─'*50}")
-        finetuned_model = bmshj2018_factorized(quality=q, pretrained=False).to(args.device)
+        finetuned_model = build_model(args.model, q, pretrained=False).to(args.device)
         ckpt = torch.load(finetuned_checkpoints[q], map_location=args.device)
         finetuned_model.load_state_dict(ckpt["state_dict"])
         finetuned_model.eval()
@@ -1298,6 +1361,7 @@ def main() -> None:
         "finetuned":  finetuned_results,
         "avif":       avif_entries,
         "config": {
+            "model":           args.model,
             "qualities":       args.qualities,
             "epochs":          args.epochs,
             "lr":              args.lr,
@@ -1384,6 +1448,7 @@ def main() -> None:
     # ── Plot ─────────────────────────────────────────────────
     print()
     plot_rd_curves(
+        model_name=args.model,
         neural_results={
             "Pretrained": pretrained_results,
             "Fine-tuned": finetuned_results,
@@ -1397,7 +1462,7 @@ def main() -> None:
 WHAT THE RESULTS MEAN
 {'='*60}
 
-fine_tune_rd.png
+{args.output_rd}
   BPP vs PSNR curves for pretrained, fine-tuned, and AVIF.
   Fine-tuned curve above/left of pretrained = domain adaptation worked.
   Gap to AVIF shows how much neural compression still needs to improve.
