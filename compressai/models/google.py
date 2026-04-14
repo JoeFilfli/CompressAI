@@ -53,6 +53,7 @@ __all__ = [
     "FactorizedPriorWavelet",
     "FactorizedPriorReLU",
     "ScaleHyperprior",
+    "TinyHyperprior",
     "MeanScaleHyperprior",
     "JointAutoregressiveHierarchicalPriors",
     "get_scale_table",
@@ -451,6 +452,22 @@ class ScaleHyperprior(CompressionModel):
         y_hat = self.gaussian_conditional.decompress(strings[0], indexes, z_hat.dtype)
         x_hat = self.g_s(y_hat).clamp_(0, 1)
         return {"x_hat": x_hat}
+
+
+@register_model("tiny-hyperprior")
+class TinyHyperprior(ScaleHyperprior):
+    r"""Lightweight ScaleHyperprior variant intended as a distillation student.
+
+    Same architecture as :class:`ScaleHyperprior` (conv/deconv + GDN blocks and
+    a scale hyperprior entropy model) but with much narrower channel widths
+    (default ``N=64``, ``M=96``) so the model is meaningfully smaller than the
+    stock builds and provides headroom for distillation to help.
+
+    No official pretrained checkpoint ships for this architecture.
+    """
+
+    def __init__(self, N: int = 64, M: int = 96, **kwargs):
+        super().__init__(N=N, M=M, **kwargs)
 
 
 @register_model("mbt2018-mean")

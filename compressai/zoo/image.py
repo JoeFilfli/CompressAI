@@ -38,6 +38,7 @@ from compressai.models import (
     JointAutoregressiveHierarchicalPriors,
     MeanScaleHyperprior,
     ScaleHyperprior,
+    TinyHyperprior,
 )
 
 from .pretrained import load_pretrained
@@ -51,6 +52,7 @@ __all__ = [
     "mbt2018_mean",
     "cheng2020_anchor",
     "cheng2020_attn",
+    "tiny_hyperprior",
 ]
 
 model_architectures = {
@@ -62,6 +64,7 @@ model_architectures = {
     "mbt2018": JointAutoregressiveHierarchicalPriors,
     "cheng2020-anchor": Cheng2020Anchor,
     "cheng2020-attn": Cheng2020Attention,
+    "tiny-hyperprior": TinyHyperprior,
 }
 
 root_url = "https://compressai.s3.amazonaws.com/models/v1"
@@ -272,6 +275,8 @@ cfgs["bmshj2018-factorized-wavelet"] = {
     8: (192, 320),
 }
 
+cfgs["tiny-hyperprior"] = {q: (64, 96) for q in range(1, 9)}
+
 def _load_model(
     architecture, metric, quality, pretrained=False, progress=True, **kwargs
 ):
@@ -461,6 +466,32 @@ def cheng2020_anchor(quality, metric="mse", pretrained=False, progress=True, **k
     return _load_model(
         "cheng2020-anchor", metric, quality, pretrained, progress, **kwargs
     )
+
+
+def tiny_hyperprior(quality, metric="mse", pretrained=False, progress=True, **kwargs):
+    r"""Lightweight ScaleHyperprior variant (N=64, M=96) intended as a
+    distillation student. No official pretrained checkpoint exists — this
+    factory only supports ``pretrained=False``.
+
+    Args:
+        quality (int): Quality levels (1: lowest, highest: 8). Affects only the
+            λ used at training time; architecture is fixed at N=64, M=96.
+        metric (str): Target metric (only ``"mse"`` is meaningful here).
+        pretrained (bool): Must be False.
+        progress (bool): Unused (no download).
+    """
+    if metric not in ("mse", "ms-ssim"):
+        raise ValueError(f'Invalid metric "{metric}"')
+
+    if quality < 1 or quality > 8:
+        raise ValueError(f'Invalid quality "{quality}", should be between (1, 8)')
+
+    if pretrained:
+        raise RuntimeError(
+            "tiny-hyperprior has no pretrained checkpoint; call with pretrained=False"
+        )
+
+    return _load_model("tiny-hyperprior", metric, quality, pretrained, progress, **kwargs)
 
 
 def cheng2020_attn(quality, metric="mse", pretrained=False, progress=True, **kwargs):
