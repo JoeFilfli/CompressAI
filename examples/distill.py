@@ -98,6 +98,8 @@ import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend — required on headless HPC nodes
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
