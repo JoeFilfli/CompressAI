@@ -332,16 +332,25 @@ def train_one_epoch(
     alpha: float,
     clip_max_norm: float,
     device: str,
+    log_interval: int = 10,
 ) -> Dict[str, float]:
     student.train()
     adapter.train()
     teacher.eval()
 
+    is_cuda = str(device).startswith("cuda")
     sum_total = sum_rd = sum_distill = sum_bpp = 0.0
     n_batches = 0
+    n_total = len(loader)
+
+    t_epoch_start = time.time()
+    t_batch_start = time.time()
 
     for i, x in enumerate(loader):
-        x = x.to(device, non_blocking=str(device).startswith("cuda"))
+        t_data = time.time() - t_batch_start  # time spent waiting for data
+
+        t_compute_start = time.time()
+        x = x.to(device, non_blocking=is_cuda)
 
         net_opt.zero_grad()
         aux_opt.zero_grad()
@@ -374,24 +383,37 @@ def train_one_epoch(
         aux_loss.backward()
         aux_opt.step()
 
+        if is_cuda:
+            torch.cuda.synchronize()
+        t_compute = time.time() - t_compute_start
+
         sum_total   += total_loss.item()
         sum_rd      += rd_loss.item()
         sum_distill += distill_loss.item()
         sum_bpp     += rd_out["bpp_loss"].item()
         n_batches   += 1
 
-        if i % 100 == 0:
-            pct = 100.0 * i / max(len(loader), 1)
+        t_batch_total = t_data + t_compute
+        elapsed = time.time() - t_epoch_start
+        batches_left = n_total - (i + 1)
+        eta = batches_left * (elapsed / (i + 1)) if i >= 0 else 0.0
+
+        if i % log_interval == 0:
+            pct = 100.0 * (i + 1) / max(n_total, 1)
             print(
                 f"    Epoch {epoch} "
-                f"[{i * len(x):6d}/{len(loader.dataset):6d} ({pct:3.0f}%)] "
+                f"[{(i + 1) * len(x):5d}/{len(loader.dataset):5d} ({pct:4.1f}%)] "
                 f"Total: {total_loss.item():.4f}  "
                 f"RD: {rd_loss.item():.4f}  "
                 f"Distill: {distill_loss.item():.4f}  "
                 f"BPP: {rd_out['bpp_loss'].item():.4f}  "
-                f"Aux: {aux_loss.item():.4f}",
+                f"Aux: {aux_loss.item():.4f}  "
+                f"| data: {t_data*1000:.0f}ms  compute: {t_compute*1000:.0f}ms  "
+                f"ETA: {eta:.0f}s",
                 flush=True,
             )
+
+        t_batch_start = time.time()
 
     n = max(n_batches, 1)
     return {
