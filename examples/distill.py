@@ -91,6 +91,7 @@ Usage examples:
 """
 
 import argparse
+import copy
 import json
 import random
 import signal
@@ -321,6 +322,17 @@ def _capture_student_y(student: nn.Module):
 
     handle = student.g_a.register_forward_hook(_hook)
     return handle, storage
+
+
+def _state_dict_to_cpu(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Clone a module state dict onto CPU so checkpoints stay device-agnostic."""
+    out: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if torch.is_tensor(value):
+            out[key] = value.detach().cpu().clone()
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
 
 
 def train_one_epoch(
@@ -589,8 +601,68 @@ def distill_one_quality(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_val_loss = float("inf")
+    best_epoch = 0
+    best_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    start_epoch = 0
 
-    for epoch in range(1, epochs + 1):
+    if out_path.exists():
+        print(f"  [diag] resume checkpoint found: {out_path}", flush=True)
+        ckpt = torch.load(out_path, map_location=device, weights_only=False)
+
+        student_state = ckpt.get("resume_state_dict") or ckpt.get("state_dict")
+        adapter_state = ckpt.get("adapter_state")
+        if student_state is not None:
+            student.load_state_dict(student_state)
+        if adapter_state is not None:
+            adapter.load_state_dict(adapter_state)
+
+        start_epoch = int(ckpt.get("epoch", 0) or 0)
+        best_epoch = int(ckpt.get("best_epoch", ckpt.get("epoch", 0) or 0))
+        best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+        saved_best_state = ckpt.get("state_dict")
+        if saved_best_state is not None:
+            best_state_dict = _state_dict_to_cpu(saved_best_state)
+
+        has_full_resume_state = True
+        if "net_opt_state" in ckpt:
+            net_opt.load_state_dict(ckpt["net_opt_state"])
+        else:
+            has_full_resume_state = False
+        if "aux_opt_state" in ckpt:
+            aux_opt.load_state_dict(ckpt["aux_opt_state"])
+        else:
+            has_full_resume_state = False
+        if "lr_scheduler_state" in ckpt:
+            lr_scheduler.load_state_dict(ckpt["lr_scheduler_state"])
+        else:
+            has_full_resume_state = False
+
+        resume_source = (
+            "latest training state" if "resume_state_dict" in ckpt else "saved best model weights"
+        )
+        print(
+            f"  [diag] resuming from epoch {start_epoch} using {resume_source}; "
+            f"best epoch={best_epoch}, best val={best_val_loss:.4f}",
+            flush=True,
+        )
+        if not has_full_resume_state:
+            print(
+                "  [diag] checkpoint predates optimizer/scheduler resume support; "
+                "continuing with restored model weights and fresh optimizer state",
+                flush=True,
+            )
+
+    if start_epoch >= epochs:
+        print(
+            f"  [diag] checkpoint already reached epoch {start_epoch}; "
+            f"requested epochs={epochs}, so training is skipped",
+            flush=True,
+        )
+        if is_cuda:
+            torch.cuda.empty_cache()
+        return out_path
+
+    for epoch in range(start_epoch + 1, epochs + 1):
         t0 = time.time()
         print(f"  [diag] epoch {epoch} train start", flush=True)
         metrics = train_one_epoch(
@@ -620,25 +692,41 @@ def distill_one_quality(
 
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
-            print(f"  [diag] saving checkpoint to {out_path}", flush=True)
-            t_save = time.time()
-            torch.save(
-                {
-                    "student":          student_name,
-                    "teacher":          teacher_name,
-                    "quality":          quality,
-                    "teacher_quality":  teacher_quality,
-                    "lmbda":            lmbda,
-                    "alpha":            alpha,
-                    "epoch":            epoch,
-                    "best_val_loss":    best_val_loss,
-                    "state_dict":       student.state_dict(),
-                    "adapter_state":    adapter.state_dict(),
-                    "adapter_channels": {"in": s_ch, "out": t_ch},
-                },
-                out_path,
-            )
-            print(f"  -> Best checkpoint saved: {out_path}  ({time.time() - t_save:.1f}s)", flush=True)
+            best_epoch = epoch
+            best_state_dict = _state_dict_to_cpu(student.state_dict())
+            print(f"  [diag] new best validation loss at epoch {epoch}", flush=True)
+
+        if best_state_dict is None:
+            best_state_dict = _state_dict_to_cpu(student.state_dict())
+
+        print(f"  [diag] saving checkpoint to {out_path}", flush=True)
+        t_save = time.time()
+        torch.save(
+            {
+                "student":            student_name,
+                "teacher":            teacher_name,
+                "quality":            quality,
+                "teacher_quality":    teacher_quality,
+                "lmbda":              lmbda,
+                "alpha":              alpha,
+                "epoch":              epoch,
+                "best_epoch":         best_epoch,
+                "best_val_loss":      best_val_loss,
+                "state_dict":         best_state_dict,
+                "resume_state_dict":  _state_dict_to_cpu(student.state_dict()),
+                "adapter_state":      _state_dict_to_cpu(adapter.state_dict()),
+                "adapter_channels":   {"in": s_ch, "out": t_ch},
+                "net_opt_state":      net_opt.state_dict(),
+                "aux_opt_state":      aux_opt.state_dict(),
+                "lr_scheduler_state": lr_scheduler.state_dict(),
+            },
+            out_path,
+        )
+        print(
+            f"  -> Checkpoint saved: {out_path}  ({time.time() - t_save:.1f}s) "
+            f"[epoch={epoch}, best_epoch={best_epoch}]",
+            flush=True,
+        )
 
     if is_cuda:
         torch.cuda.empty_cache()
@@ -781,7 +869,10 @@ def load_distilled_student(
 ) -> nn.Module:
     model = build_model(student_name, quality, pretrained=False).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["state_dict"])
+    state_dict = ckpt.get("state_dict")
+    if state_dict is None:
+        state_dict = ckpt["resume_state_dict"]
+    model.load_state_dict(state_dict)
     model.eval()
     return model
 
