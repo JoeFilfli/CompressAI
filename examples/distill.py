@@ -93,6 +93,7 @@ Usage examples:
 import argparse
 import json
 import random
+import signal
 import time
 import warnings
 from pathlib import Path
@@ -442,8 +443,10 @@ def validate_one_epoch(
     sum_total = sum_rd = sum_distill = sum_bpp = 0.0
     n_batches = 0
 
+    n_total_val = len(loader)
     with torch.inference_mode():
-        for x in loader:
+        for i, x in enumerate(loader):
+            print(f"    [val] batch {i}/{n_total_val} start", flush=True)
             x = x.to(device, non_blocking=str(device).startswith("cuda"))
 
             handle, captured = _capture_student_y(student)
@@ -452,6 +455,7 @@ def validate_one_epoch(
             finally:
                 handle.remove()
             y_student = captured[0]
+            print(f"    [val] batch {i}/{n_total_val} student fwd done", flush=True)
 
             rd_out = criterion(out_student, x)
             rd_loss = rd_out["loss"]
@@ -467,6 +471,7 @@ def validate_one_epoch(
             sum_distill += distill_loss.item()
             sum_bpp     += rd_out["bpp_loss"].item()
             n_batches   += 1
+            print(f"    [val] batch {i}/{n_total_val} done  BPP: {rd_out['bpp_loss'].item():.4f}", flush=True)
 
     if n_batches == 0:
         raise RuntimeError("Validation loader produced zero batches")
@@ -587,15 +592,19 @@ def distill_one_quality(
 
     for epoch in range(1, epochs + 1):
         t0 = time.time()
+        print(f"  [diag] epoch {epoch} train start", flush=True)
         metrics = train_one_epoch(
             student, teacher, adapter, criterion,
             train_loader, net_opt, aux_opt,
             epoch, alpha, clip_max_norm, device,
         )
         elapsed = time.time() - t0
+        print(f"  [diag] epoch {epoch} train done ({elapsed:.1f}s) — starting validation", flush=True)
+        t_val = time.time()
         val_metrics = validate_one_epoch(
             student, teacher, adapter, criterion, val_loader, alpha, device,
         )
+        print(f"  [diag] epoch {epoch} validation done ({time.time() - t_val:.1f}s) — stepping scheduler", flush=True)
         lr_scheduler.step(val_metrics["loss"])
         current_lr = net_opt.param_groups[0]["lr"]
 
@@ -605,11 +614,14 @@ def distill_one_quality(
             f"TrainDistill: {metrics['distill_loss']:.4f}  "
             f"ValDistill: {val_metrics['distill_loss']:.4f}  "
             f"TrainBPP: {metrics['bpp_loss']:.4f}  ValBPP: {val_metrics['bpp_loss']:.4f}  "
-            f"LR: {current_lr:.1e}"
+            f"LR: {current_lr:.1e}",
+            flush=True,
         )
 
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
+            print(f"  [diag] saving checkpoint to {out_path}", flush=True)
+            t_save = time.time()
             torch.save(
                 {
                     "student":          student_name,
@@ -626,7 +638,7 @@ def distill_one_quality(
                 },
                 out_path,
             )
-            print(f"  -> Best checkpoint saved: {out_path}")
+            print(f"  -> Best checkpoint saved: {out_path}  ({time.time() - t_save:.1f}s)", flush=True)
 
     if is_cuda:
         torch.cuda.empty_cache()
@@ -644,13 +656,31 @@ def evaluate_model(
     device: str,
     warmup_iters: int = 1,
     label: str = "",
+    img_timeout_s: int = 60,
 ) -> Optional[Dict]:
     """Compress/decompress each test image; return averaged BPP, PSNR, MS-SSIM, enc/dec ms."""
     model.eval()
-    model.update()
+    print(f"  [eval] running model.update() ...", flush=True)
+    t_upd = time.perf_counter()
+    try:
+        def _upd_timeout(signum, frame):
+            raise TimeoutError("model.update() timed out after 120s")
+        signal.signal(signal.SIGALRM, _upd_timeout)
+        signal.alarm(120)
+        model.update()
+        signal.alarm(0)
+    except TimeoutError as exc:
+        signal.alarm(0)
+        print(f"  [eval] {exc} — skipping evaluation for this model", flush=True)
+        return None
+    print(f"  [eval] model.update() done ({time.perf_counter() - t_upd:.1f}s)", flush=True)
 
     if images and warmup_iters > 0:
         try:
+            def _warmup_timeout(signum, frame):
+                raise TimeoutError("warmup timed out")
+            signal.signal(signal.SIGALRM, _warmup_timeout)
+            signal.alarm(img_timeout_s)
             img = Image.open(images[0]).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
             pad, _ = compute_padding(x.shape[2], x.shape[3], min_div=64)
@@ -660,8 +690,10 @@ def evaluate_model(
                     out_enc = model.compress(x_padded)
                     model.decompress(out_enc["strings"], out_enc["shape"])
             sync_device(device)
+            signal.alarm(0)
         except Exception as exc:
-            print(f"  Warmup skipped ({exc})")
+            signal.alarm(0)
+            print(f"  Warmup skipped ({exc})", flush=True)
 
     bpps:     List[float] = []
     psnrs:    List[float] = []
@@ -670,7 +702,13 @@ def evaluate_model(
     dec_ms:   List[float] = []
 
     for i, img_path in enumerate(images, 1):
+        print(f"  [eval] image {i}/{len(images)} {img_path.name} ...", flush=True)
         try:
+            def _img_timeout(signum, frame):
+                raise TimeoutError(f"image timed out after {img_timeout_s}s")
+            signal.signal(signal.SIGALRM, _img_timeout)
+            signal.alarm(img_timeout_s)
+
             img = Image.open(img_path).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
             h, w = x.shape[2], x.shape[3]
@@ -696,6 +734,8 @@ def evaluate_model(
 
                 x_hat = F.pad(out_dec["x_hat"], unpad).clamp(0, 1)
 
+            signal.alarm(0)
+
             bpp = (compressed_bytes * 8) / (h * w)
             mse = F.mse_loss(x.cpu(), x_hat.cpu()).item()
 
@@ -712,10 +752,12 @@ def evaluate_model(
             print(
                 f"    [{i:3d}/{len(images)}] {img_path.name} | "
                 f"BPP: {bpp:.4f} | PSNR: {psnrs[-1]:.2f} dB | "
-                f"Enc: {encode_ms:.1f}ms | Dec: {decode_ms:.1f}ms"
+                f"Enc: {encode_ms:.1f}ms | Dec: {decode_ms:.1f}ms",
+                flush=True,
             )
         except Exception as exc:
-            print(f"    [{i:3d}/{len(images)}] {img_path.name} FAILED: {exc}")
+            signal.alarm(0)
+            print(f"    [{i:3d}/{len(images)}] {img_path.name} FAILED: {exc}", flush=True)
 
     if not bpps:
         return None
