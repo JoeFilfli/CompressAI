@@ -92,6 +92,7 @@ Usage examples:
 
 import argparse
 import json
+import math
 import random
 import time
 import warnings
@@ -674,16 +675,26 @@ def evaluate_model(
 
             bpp = (compressed_bytes * 8) / (h * w)
             mse = F.mse_loss(x.cpu(), x_hat.cpu()).item()
+            psnr_val = psnr_from_mse(mse)
 
-            bpps.append(bpp)
-            psnrs.append(psnr_from_mse(mse))
             enc_ms.append(encode_ms)
             dec_ms.append(decode_ms)
 
-            if MSSSIM_AVAILABLE:
-                ms_ssims.append(
-                    float(compute_msssim(x.cpu(), x_hat.cpu(), data_range=1.0).item())
+            if not (math.isfinite(bpp) and math.isfinite(psnr_val)):
+                print(
+                    f"    [{i:3d}/{len(images)}] {img_path.name} SKIPPED "
+                    f"(non-finite: bpp={bpp}, mse={mse}, psnr={psnr_val}) | "
+                    f"Enc: {encode_ms:.1f}ms | Dec: {decode_ms:.1f}ms"
                 )
+                continue
+
+            bpps.append(bpp)
+            psnrs.append(psnr_val)
+
+            if MSSSIM_AVAILABLE:
+                ms_val = float(compute_msssim(x.cpu(), x_hat.cpu(), data_range=1.0).item())
+                if math.isfinite(ms_val):
+                    ms_ssims.append(ms_val)
 
             print(
                 f"    [{i:3d}/{len(images)}] {img_path.name} | "
@@ -693,17 +704,27 @@ def evaluate_model(
         except Exception as exc:
             print(f"    [{i:3d}/{len(images)}] {img_path.name} FAILED: {exc}")
 
-    if not bpps:
+    finite_bpps  = [v for v in bpps  if math.isfinite(v)]
+    finite_psnrs = [v for v in psnrs if math.isfinite(v)]
+    finite_ms    = [v for v in ms_ssims if math.isfinite(v)]
+    finite_enc   = [v for v in enc_ms if math.isfinite(v)]
+    finite_dec   = [v for v in dec_ms if math.isfinite(v)]
+
+    if not finite_bpps or not finite_psnrs:
+        print(
+            f"  [warn] evaluate_model({label!r}): 0 finite RD samples "
+            f"out of {len(images)} images — returning None"
+        )
         return None
 
     return {
         "label":         label,
-        "avg_bpp":       round(float(np.mean(bpps)),     4),
-        "avg_psnr":      round(float(np.mean(psnrs)),    2),
-        "avg_ms_ssim":   round(float(np.mean(ms_ssims)), 4) if ms_ssims else None,
-        "avg_encode_ms": round(float(np.mean(enc_ms)),   1),
-        "avg_decode_ms": round(float(np.mean(dec_ms)),   1),
-        "n_images":      len(bpps),
+        "avg_bpp":       round(float(np.mean(finite_bpps)),  4),
+        "avg_psnr":      round(float(np.mean(finite_psnrs)), 2),
+        "avg_ms_ssim":   round(float(np.mean(finite_ms)),    4) if finite_ms else None,
+        "avg_encode_ms": round(float(np.mean(finite_enc)),   1) if finite_enc else None,
+        "avg_decode_ms": round(float(np.mean(finite_dec)),   1) if finite_dec else None,
+        "n_images":      len(finite_bpps),
     }
 
 
@@ -725,11 +746,15 @@ def load_distilled_student(
 # ─────────────────────────────────────────────────────────────
 
 def _valid_rd_entries(entries: List[Dict]) -> List[Dict]:
-    return sorted(
-        [e for e in entries
-         if e and e.get("avg_psnr") is not None and e.get("avg_bpp") is not None],
-        key=lambda e: e["avg_bpp"],
-    )
+    def _ok(e: Optional[Dict]) -> bool:
+        if not e:
+            return False
+        p, b = e.get("avg_psnr"), e.get("avg_bpp")
+        return (
+            p is not None and b is not None
+            and math.isfinite(p) and math.isfinite(b)
+        )
+    return sorted([e for e in entries if _ok(e)], key=lambda e: e["avg_bpp"])
 
 
 def _teacher_style(teacher: str, index: int) -> Tuple[str, str]:
@@ -768,7 +793,8 @@ def plot_rd_curves(
         states = results[student]
         any_curve = False
 
-        pre_valid = _valid_rd_entries(states.get("pretrained", []))
+        pre_raw   = states.get("pretrained", []) or []
+        pre_valid = _valid_rd_entries(pre_raw)
         if pre_valid:
             ax.plot(
                 [e["avg_bpp"]  for e in pre_valid],
@@ -781,11 +807,23 @@ def plot_rd_curves(
                 label=f"pretrained {student}",
             )
             any_curve = True
+        elif pre_raw:
+            print(
+                f"  [warn] {student} pretrained: {len(pre_raw)} entries but all "
+                "non-finite (NaN/inf) — curve skipped"
+            )
 
         distilled = states.get("distilled", {}) or {}
         for idx, teacher in enumerate(sorted(distilled.keys())):
-            d_valid = _valid_rd_entries(distilled[teacher])
+            d_raw   = distilled[teacher] or []
+            d_valid = _valid_rd_entries(d_raw)
             if not d_valid:
+                if d_raw:
+                    print(
+                        f"  [warn] {student} distilled ← {teacher}: "
+                        f"{len(d_raw)} entries but all non-finite (NaN/inf) "
+                        "— curve skipped"
+                    )
                 continue
             color, marker = _teacher_style(teacher, idx)
             ax.plot(
@@ -801,8 +839,14 @@ def plot_rd_curves(
             any_curve = True
 
         for idx, codec in enumerate(sorted(reference_results.keys())):
-            r_valid = _valid_rd_entries(reference_results[codec])
+            r_raw   = reference_results[codec] or []
+            r_valid = _valid_rd_entries(r_raw)
             if not r_valid:
+                if r_raw:
+                    print(
+                        f"  [warn] reference {codec}: {len(r_raw)} entries "
+                        "but all non-finite (NaN/inf) — curve skipped"
+                    )
                 continue
             ref_color = REFERENCE_COLOR_CYCLE[idx % len(REFERENCE_COLOR_CYCLE)]
             ref_marker = REFERENCE_MARKER_CYCLE[idx % len(REFERENCE_MARKER_CYCLE)]
