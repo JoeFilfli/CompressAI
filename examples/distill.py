@@ -738,55 +738,6 @@ def distill_one_quality(
 # EVALUATION (RD + runtime)
 # ─────────────────────────────────────────────────────────────
 
-def _trace_nan_in_decompress(model: nn.Module, strings, shape, img_name: str) -> None:
-    """
-    Step through the ScaleHyperprior decompress chain with NaN checks at each
-    stage.  Only called when x_hat is already known to contain NaN, so the
-    extra overhead is fine.
-    """
-    def _has_bad(t: torch.Tensor) -> bool:
-        return bool((t.isnan() | t.isinf()).any().item())
-    def _stats(t: torch.Tensor) -> str:
-        fin = t[t.isfinite()]
-        if fin.numel() == 0:
-            return "all non-finite"
-        return (f"min={fin.min().item():.3g} max={fin.max().item():.3g} "
-                f"nan={t.isnan().sum().item()} inf={t.isinf().sum().item()}")
-
-    print(f"      [NaN-trace] {img_name}: starting layer-by-layer decompress trace", flush=True)
-
-    with torch.inference_mode():
-        # ── Stage 1: entropy bottleneck ──────────────────────────
-        z_hat = model.entropy_bottleneck.decompress(strings[1], shape)
-        print(f"      [NaN-trace] z_hat (entropy_bottleneck): {_stats(z_hat)}", flush=True)
-
-        # ── Stage 2: h_s (hyperprior decoder) ───────────────────
-        x = z_hat
-        for idx, layer in enumerate(model.h_s):
-            x = layer(x)
-            if _has_bad(x):
-                print(f"      [NaN-trace] h_s[{idx}] ({layer.__class__.__name__}) introduced NaN: {_stats(x)}", flush=True)
-            else:
-                print(f"      [NaN-trace] h_s[{idx}] ({layer.__class__.__name__}): OK  {_stats(x)}", flush=True)
-        scales_hat = x
-        print(f"      [NaN-trace] scales_hat: {_stats(scales_hat)}", flush=True)
-
-        # ── Stage 3: gaussian_conditional ───────────────────────
-        indexes = model.gaussian_conditional.build_indexes(scales_hat)
-        print(f"      [NaN-trace] indexes: min={indexes.min().item()} max={indexes.max().item()}", flush=True)
-        y_hat = model.gaussian_conditional.decompress(strings[0], indexes, z_hat.dtype)
-        print(f"      [NaN-trace] y_hat (gaussian_conditional): {_stats(y_hat)}", flush=True)
-
-        # ── Stage 4: g_s (synthesis transform), layer by layer ──
-        x = y_hat
-        for idx, layer in enumerate(model.g_s):
-            x = layer(x)
-            if _has_bad(x):
-                print(f"      [NaN-trace] g_s[{idx}] ({layer.__class__.__name__}) introduced NaN: {_stats(x)}", flush=True)
-            else:
-                print(f"      [NaN-trace] g_s[{idx}] ({layer.__class__.__name__}): OK  {_stats(x)}", flush=True)
-
-
 def evaluate_model(
     model: nn.Module,
     images: List[Path],
@@ -882,8 +833,6 @@ def evaluate_model(
                         f"max={x_hat_raw[x_hat_raw.isfinite()].max().item():.4f})",
                         flush=True,
                     )
-                    if hasattr(model, "entropy_bottleneck") and hasattr(model, "g_s"):
-                        _trace_nan_in_decompress(model, out_enc["strings"], out_enc["shape"], img_path.name)
                 x_hat = F.pad(x_hat_raw, unpad).clamp(0, 1)
 
             signal.alarm(0)
