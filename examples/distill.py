@@ -518,6 +518,7 @@ def distill_one_quality(
     prefetch_factor: int,
     loader_backend: str,
     seed: int,
+    reset_lr: bool = False,
 ) -> Path:
     """Distill one student at one quality; save best-validation checkpoint. Returns its path."""
 
@@ -636,6 +637,16 @@ def distill_one_quality(
             lr_scheduler.load_state_dict(ckpt["lr_scheduler_state"])
         else:
             has_full_resume_state = False
+
+        if reset_lr:
+            for pg in net_opt.param_groups:
+                pg["lr"] = lr
+            for pg in aux_opt.param_groups:
+                pg["lr"] = aux_lr
+            lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                net_opt, mode="min", factor=0.5, patience=2
+            )
+            print(f"  [diag] --reset-lr: overrode LR to net={lr:.1e} aux={aux_lr:.1e} and reset scheduler", flush=True)
 
         resume_source = (
             "latest training state" if "resume_state_dict" in ckpt else "saved best model weights"
@@ -1261,6 +1272,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--eval-only",       action="store_true",
                         help="Skip training; evaluate existing distilled checkpoints")
+    parser.add_argument("--reset-lr",        action="store_true",
+                        help="When resuming, override saved LR with --lr / --aux-lr and reset the scheduler")
     parser.add_argument("--max-test-images", type=int, default=None)
     parser.add_argument("--seed",            type=int, default=42)
     return parser.parse_args()
@@ -1364,6 +1377,7 @@ def main() -> None:
                         prefetch_factor=args.prefetch_factor,
                         loader_backend=args.loader_backend,
                         seed=args.seed,
+                        reset_lr=args.reset_lr,
                     )
 
     # { student: { quality: { teacher: path } } }
