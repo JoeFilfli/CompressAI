@@ -820,7 +820,20 @@ def evaluate_model(
                 sync_device(device)
                 decode_ms = (time.perf_counter() - t0) * 1000
 
-                x_hat = F.pad(out_dec["x_hat"], unpad).clamp(0, 1)
+                x_hat_raw = out_dec["x_hat"]
+                # Diagnose NaN/Inf before clamping so we know where it comes from
+                n_nan = int(x_hat_raw.isnan().sum().item())
+                n_inf = int(x_hat_raw.isinf().sum().item())
+                if n_nan or n_inf:
+                    print(
+                        f"    [{i:3d}/{len(images)}] {img_path.name} "
+                        f"DECODER NaN/Inf: x_hat has {n_nan} NaN and {n_inf} Inf values "
+                        f"(shape={list(x_hat_raw.shape)}, "
+                        f"min={x_hat_raw[x_hat_raw.isfinite()].min().item():.4f}, "
+                        f"max={x_hat_raw[x_hat_raw.isfinite()].max().item():.4f})",
+                        flush=True,
+                    )
+                x_hat = F.pad(x_hat_raw, unpad).clamp(0, 1)
 
             signal.alarm(0)
 
@@ -850,14 +863,19 @@ def evaluate_model(
     if not bpps:
         return None
 
+    n_nan_psnr = sum(1 for v in psnrs if not np.isfinite(v))
+    if n_nan_psnr:
+        print(f"  [eval] Warning: {n_nan_psnr}/{len(psnrs)} images had NaN/Inf PSNR — excluded from average", flush=True)
+
     return {
         "label":         label,
-        "avg_bpp":       round(float(np.mean(bpps)),     4),
-        "avg_psnr":      round(float(np.mean(psnrs)),    2),
-        "avg_ms_ssim":   round(float(np.mean(ms_ssims)), 4) if ms_ssims else None,
-        "avg_encode_ms": round(float(np.mean(enc_ms)),   1),
-        "avg_decode_ms": round(float(np.mean(dec_ms)),   1),
+        "avg_bpp":       round(float(np.nanmean(bpps)),     4),
+        "avg_psnr":      round(float(np.nanmean(psnrs)),    2),
+        "avg_ms_ssim":   round(float(np.nanmean(ms_ssims)), 4) if ms_ssims else None,
+        "avg_encode_ms": round(float(np.nanmean(enc_ms)),   1),
+        "avg_decode_ms": round(float(np.nanmean(dec_ms)),   1),
         "n_images":      len(bpps),
+        "n_nan_psnr":    n_nan_psnr,
     }
 
 
@@ -882,9 +900,10 @@ def load_distilled_student(
 # ─────────────────────────────────────────────────────────────
 
 def _valid_rd_entries(entries: List[Dict]) -> List[Dict]:
+    def _is_finite(v):
+        return v is not None and np.isfinite(v)
     return sorted(
-        [e for e in entries
-         if e and e.get("avg_psnr") is not None and e.get("avg_bpp") is not None],
+        [e for e in entries if e and _is_finite(e.get("avg_psnr")) and _is_finite(e.get("avg_bpp"))],
         key=lambda e: e["avg_bpp"],
     )
 
