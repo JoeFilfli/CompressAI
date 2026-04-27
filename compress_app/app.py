@@ -41,6 +41,40 @@ def _folder_row(label: str, session_key: str, browse_key: str, initial: Path) ->
     return path
 
 
+# ── Table helpers ─────────────────────────────────────────────────────────────
+
+def _compress_df(results: list[dict], show_metrics: bool) -> pd.DataFrame:
+    rows = []
+    for r in results:
+        row = {
+            "File":              r.get("file"),
+            "Original (KB)":    round(r["orig_kb"], 2) if r.get("orig_kb") is not None else None,
+            "Compressed (KB)":  round(r["comp_kb"], 2) if r.get("comp_kb") is not None else None,
+            "Ratio":            round(r["ratio"], 2)   if r.get("ratio")   is not None else None,
+            "BPP":              round(r["bpp"], 3)     if r.get("bpp")     is not None else None,
+            "Status":           r.get("status"),
+        }
+        if show_metrics:
+            row["PSNR (dB)"] = round(r["psnr"], 2)   if r.get("psnr")   is not None else None
+            row["MS-SSIM"]   = round(r["msssim"], 4) if r.get("msssim") is not None else None
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _decompress_df(results: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "File":               r.get("file"),
+            "Compressed (KB)":   round(r["comp_kb"], 2) if r.get("comp_kb") is not None else None,
+            "Output (KB)":       round(r["out_kb"], 2)  if r.get("out_kb")  is not None else None,
+            "Model":             r.get("model"),
+            "Quality":           r.get("quality"),
+            "Status":            r.get("status"),
+        }
+        for r in results
+    ])
+
+
 # ── Summary helpers ───────────────────────────────────────────────────────────
 
 def _compress_summary(results: list[dict], show_metrics: bool, elapsed: float) -> None:
@@ -53,23 +87,36 @@ def _compress_summary(results: list[dict], show_metrics: bool, elapsed: float) -
 
     st.markdown("---")
     st.subheader("Summary")
-    c = st.columns(7)
-    c[0].metric("Processed", ok)
-    c[1].metric("Failed", len(failed))
-    c[2].metric("Input (MB)", f"{total_in:.2f}")
-    c[3].metric("Output (MB)", f"{total_out:.2f}")
-    c[4].metric("Ratio", f"{ratio:.2f}×")
-    c[5].metric("Total Time", f"{elapsed:.1f}s")
-    c[6].metric("Avg per Image", f"{avg_s:.2f}s")
+
+    card1, card2 = st.columns(2)
+
+    with card1:
+        with st.container(border=True):
+            st.caption("BATCH")
+            r = st.columns(2)
+            r[0].metric("Processed", ok)
+            r[1].metric("Failed", len(failed))
+            r2 = st.columns(2)
+            r2[0].metric("Total Time", f"{elapsed:.1f}s")
+            r2[1].metric("Avg per Image", f"{avg_s:.2f}s")
+
+    with card2:
+        with st.container(border=True):
+            st.caption("SIZE & COMPRESSION")
+            r = st.columns(2)
+            r[0].metric("Input (MB)", f"{total_in:.2f}")
+            r[1].metric("Compressed (MB)", f"{total_out:.2f}")
+            st.metric("Compression Ratio", f"{ratio:.2f}×")
 
     if show_metrics:
         psnr_vals = [r["psnr"] for r in results if r.get("psnr") is not None]
         ms_vals = [r["msssim"] for r in results if r.get("msssim") is not None]
-        m = st.columns(2)
-        if psnr_vals:
-            m[0].metric("Avg PSNR (dB)", f"{sum(psnr_vals) / len(psnr_vals):.2f}")
-        if ms_vals:
-            m[1].metric("Avg MS-SSIM", f"{sum(ms_vals) / len(ms_vals):.4f}")
+        if psnr_vals or ms_vals:
+            with st.container(border=True):
+                st.caption("QUALITY")
+                r = st.columns(2)
+                r[0].metric("Avg PSNR (dB)", f"{sum(psnr_vals) / len(psnr_vals):.2f}" if psnr_vals else "—")
+                r[1].metric("Avg MS-SSIM", f"{sum(ms_vals) / len(ms_vals):.4f}" if ms_vals else "—")
 
     if failed:
         with st.expander(f"Failed Files ({len(failed)})"):
@@ -86,13 +133,25 @@ def _decompress_summary(results: list[dict], elapsed: float) -> None:
 
     st.markdown("---")
     st.subheader("Summary")
-    c = st.columns(6)
-    c[0].metric("Processed", ok)
-    c[1].metric("Failed", len(failed))
-    c[2].metric("Compressed Input (MB)", f"{total_in:.2f}")
-    c[3].metric("Reconstructed Output (MB)", f"{total_out:.2f}")
-    c[4].metric("Total Time", f"{elapsed:.1f}s")
-    c[5].metric("Avg per File", f"{avg_s:.2f}s")
+
+    card1, card2 = st.columns(2)
+
+    with card1:
+        with st.container(border=True):
+            st.caption("BATCH")
+            r = st.columns(2)
+            r[0].metric("Processed", ok)
+            r[1].metric("Failed", len(failed))
+            r2 = st.columns(2)
+            r2[0].metric("Total Time", f"{elapsed:.1f}s")
+            r2[1].metric("Avg per File", f"{avg_s:.2f}s")
+
+    with card2:
+        with st.container(border=True):
+            st.caption("SIZE")
+            r = st.columns(2)
+            r[0].metric("Compressed Input (MB)", f"{total_in:.2f}")
+            r[1].metric("Reconstructed Output (MB)", f"{total_out:.2f}")
 
     if failed:
         with st.expander(f"Failed Files ({len(failed)})"):
@@ -165,16 +224,12 @@ with compress_tab:
                 results = []
                 t_start = time.time()
 
-                display_cols = ["file", "orig_kb", "comp_kb", "ratio", "bpp", "status"]
-                if metrics:
-                    display_cols += ["psnr", "msssim"]
-
                 for i, result in enumerate(gen):
                     results.append(result)
                     progress.progress((i + 1) / total)
                     status.text(f"Processing: {result['file']}")
                     table_ph.dataframe(
-                        pd.DataFrame([{k: r.get(k) for k in display_cols} for r in results]),
+                        _compress_df(results, show_metrics=metrics),
                         use_container_width=True,
                     )
                     if metrics and result.get("orig_image") and result.get("recon_image"):
@@ -232,10 +287,7 @@ with decompress_tab:
                     progress.progress((i + 1) / total)
                     status.text(f"Processing: {result['file']}")
                     table_ph.dataframe(
-                        pd.DataFrame([
-                            {k: r.get(k) for k in ["file", "comp_kb", "out_kb", "model", "quality", "status"]}
-                            for r in results
-                        ]),
+                        _decompress_df(results),
                         use_container_width=True,
                     )
 
