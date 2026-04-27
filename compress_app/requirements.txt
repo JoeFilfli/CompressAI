@@ -1,0 +1,6 @@
+streamlit
+torch
+torchvision
+Pillow
+pytorch-msssim
+compressai
