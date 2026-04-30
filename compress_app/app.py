@@ -118,6 +118,21 @@ def _compress_summary(results: list[dict], show_metrics: bool, elapsed: float) -
                 r[0].metric("Avg PSNR (dB)", f"{sum(psnr_vals) / len(psnr_vals):.2f}" if psnr_vals else "—")
                 r[1].metric("Avg MS-SSIM", f"{sum(ms_vals) / len(ms_vals):.4f}" if ms_vals else "—")
 
+    total_jpeg = sum(r.get("jpeg_kb") or 0 for r in results if r.get("jpeg_kb")) / 1024
+    if total_jpeg > 0:
+        saved = total_jpeg - total_out
+        pct = (saved / total_jpeg) * 100
+        if saved > 0:
+            st.success(
+                f"You saved **{saved:.2f} MB ({pct:.1f}%)** compared to "
+                f"standard JPEG compression."
+            )
+        else:
+            st.info(
+                f"At this quality level, output is **{abs(saved):.2f} MB ({abs(pct):.1f}%) larger** "
+                f"than standard JPEG compression."
+            )
+
     if failed:
         with st.expander(f"Failed Files ({len(failed)})"):
             for r in failed:

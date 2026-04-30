@@ -1,3 +1,4 @@
+import io
 import json
 import struct
 from pathlib import Path
@@ -43,6 +44,7 @@ def compress_folder(
                 "error": None,
                 "orig_kb": image_path.stat().st_size / 1024,
                 "comp_kb": None,
+                "jpeg_kb": None,
                 "ratio": None,
                 "bpp": None,
                 "psnr": None,
@@ -53,6 +55,11 @@ def compress_folder(
 
             try:
                 img = load_image(image_path)
+
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85)
+                result["jpeg_kb"] = buf.tell() / 1024
+
                 x = to_tensor(img).unsqueeze(0).to(device)
                 x_padded, orig_h, orig_w = pad_to_multiple(x)
 
