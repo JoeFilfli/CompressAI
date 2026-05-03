@@ -2,7 +2,7 @@ import io
 import json
 import struct
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 import torch
 from torchvision.transforms.functional import to_pil_image, to_tensor
@@ -27,12 +27,13 @@ def compress_folder(
     recursive: bool,
     metrics: bool,
     delete_source: bool,
+    checkpoint_path: Optional[Path] = None,
 ) -> tuple[int, Iterator[dict]]:
     images = scan_images(input_folder, recursive)
     total = len(images)
 
     def _generate() -> Iterator[dict]:
-        model = load_model(model_name, quality, device)
+        model = load_model(model_name, quality, device, checkpoint_path=checkpoint_path)
 
         for image_path in images:
             rel_path = image_path.relative_to(input_folder)
@@ -51,6 +52,8 @@ def compress_folder(
                 "msssim": None,
                 "orig_image": None,
                 "recon_image": None,
+                "comp_time": None,
+                "decomp_time": None,
             }
 
             try:
@@ -63,8 +66,10 @@ def compress_folder(
                 x = to_tensor(img).unsqueeze(0).to(device)
                 x_padded, orig_h, orig_w = pad_to_multiple(x)
 
+                t_comp = time.time()
                 with torch.no_grad():
                     compressed = model.compress(x_padded)
+                result["comp_time"] = time.time() - t_comp
 
                 strings = compressed["strings"]
                 shape = compressed["shape"]
@@ -78,6 +83,9 @@ def compress_folder(
                     "shape": list(shape),
                     "string_lengths": [len(b) for b in string_bytes],
                 }
+                if checkpoint_path:
+                    header["checkpoint"] = str(checkpoint_path)
+                    header["checkpoint_name"] = checkpoint_path.name
                 header_bytes = json.dumps(header).encode("utf-8")
 
                 out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,8 +102,10 @@ def compress_folder(
                 result["bpp"] = (out_path.stat().st_size * 8) / num_pixels
 
                 if metrics:
+                    t_decomp = time.time()
                     with torch.no_grad():
                         decompressed = model.decompress(strings, shape)
+                    result["decomp_time"] = time.time() - t_decomp
                     x_hat = crop_to_original(decompressed["x_hat"], orig_h, orig_w)
                     x_orig = crop_to_original(x_padded, orig_h, orig_w)
                     result["psnr"] = compute_psnr(x_orig, x_hat)

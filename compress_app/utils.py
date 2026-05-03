@@ -1,12 +1,14 @@
 from pathlib import Path
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from compressai.zoo import image_models
+from compressai.zoo.image import cfgs as _ZOO_CFGS
 from PIL import Image
 from torchvision.transforms.functional import to_pil_image
 
-MODELS = [
+BUILTIN_MODELS = [
     "bmshj2018-factorized",
     "bmshj2018-hyperprior",
     "mbt2018",
@@ -15,16 +17,132 @@ MODELS = [
     "cheng2020-attn",
 ]
 
+CUSTOM_BASE_MODELS = BUILTIN_MODELS + ["tiny-hyperprior"]
+
+MODELS = BUILTIN_MODELS
+
 _MODEL_CACHE: dict = {}
 
+_DISTILL_SEP = "_distilled_from_"
 
-def load_model(name: str, quality: int, device: str) -> torch.nn.Module:
-    key = (name, quality, device)
-    if key not in _MODEL_CACHE:
+_SCALE_HYPERPRIOR_CFGS = {}
+for _arch, _quality_map in _ZOO_CFGS.items():
+    for _cfg in _quality_map.values():
+        if isinstance(_cfg, tuple) and len(_cfg) == 2:
+            _SCALE_HYPERPRIOR_CFGS.setdefault(_arch, set()).add(_cfg)
+
+_ORDERED_SCALE_ARCHS = [
+    arch for arch in CUSTOM_BASE_MODELS if arch in _SCALE_HYPERPRIOR_CFGS
+]
+
+
+def parse_distilled_checkpoint_name(path: Path) -> Optional[Tuple[str, int, str]]:
+    name = path.name
+    if not name.endswith(".pth") or _DISTILL_SEP not in name:
+        return None
+    left, teacher_part = name.rsplit(_DISTILL_SEP, 1)
+    teacher = teacher_part[:-4]
+    if "_q" not in left:
+        return None
+    student, q_part = left.rsplit("_q", 1)
+    try:
+        quality = int(q_part)
+    except ValueError:
+        return None
+    return student, quality, teacher
+
+
+def list_custom_checkpoints(base_dir: Path) -> list[dict]:
+    checkpoints = []
+    for path in sorted(base_dir.glob("*.pth")):
+        info = {
+            "path": path,
+            "label": path.name,
+            "student": "tiny-hyperprior",
+            "quality": None,
+            "teacher": None,
+        }
+        parsed = parse_distilled_checkpoint_name(path)
+        if parsed:
+            student, quality, teacher = parsed
+            info["student"] = student
+            info["quality"] = quality
+            info["teacher"] = teacher
+            info["label"] = f"{student} q{quality} (distilled from {teacher})"
+        checkpoints.append(info)
+    return checkpoints
+
+
+def _extract_state_dict(ckpt: object) -> dict:
+    if isinstance(ckpt, dict):
+        for key in ("state_dict", "model_state_dict", "resume_state_dict"):
+            if key in ckpt and isinstance(ckpt[key], dict):
+                return ckpt[key]
+        if ckpt and all(torch.is_tensor(v) for v in ckpt.values()):
+            return ckpt
+    raise ValueError("Unsupported checkpoint format")
+
+
+def _strip_module_prefix(state_dict: dict) -> dict:
+    if state_dict and all(k.startswith("module.") for k in state_dict.keys()):
+        return {k[len("module."):]: v for k, v in state_dict.items()}
+    student_keys = {k for k in state_dict if k.startswith("student.")}
+    if student_keys:
+        return {k[len("student."):]: v for k, v in state_dict.items() if k in student_keys}
+    return state_dict
+
+
+def _infer_nm_from_state(state_dict: dict) -> Optional[Tuple[int, int]]:
+    if "g_a.0.weight" in state_dict and "g_a.6.weight" in state_dict:
+        n = int(state_dict["g_a.0.weight"].shape[0])
+        m = int(state_dict["g_a.6.weight"].shape[0])
+        return n, m
+    return None
+
+
+def infer_checkpoint_base(checkpoint_path: Path) -> dict:
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    state = _extract_state_dict(ckpt)
+    state = _strip_module_prefix(state)
+    nm = _infer_nm_from_state(state)
+
+    n = m = None
+    matches = []
+    if nm:
+        n, m = nm
+        for arch in _ORDERED_SCALE_ARCHS:
+            if (n, m) in _SCALE_HYPERPRIOR_CFGS[arch]:
+                matches.append(arch)
+
+    base = matches[0] if len(matches) == 1 else None
+    return {"n": n, "m": m, "matches": matches, "base": base}
+
+
+def load_model(
+    name: str,
+    quality: int,
+    device: str,
+    checkpoint_path: Optional[Path] = None,
+) -> torch.nn.Module:
+    ckpt_key = str(checkpoint_path) if checkpoint_path else None
+    key = (name, quality, device, ckpt_key)
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
+
+    if checkpoint_path:
+        model = image_models[name](quality=quality, pretrained=False)
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        state = _strip_module_prefix(_extract_state_dict(ckpt))
+        model.load_state_dict(state, strict=True)
+        model.eval().to(device)
+        if hasattr(model, "update"):
+            model.update(force=True)
+    else:
         model = image_models[name](quality=quality, pretrained=True)
         model.eval().to(device)
-        _MODEL_CACHE[key] = model
-    return _MODEL_CACHE[key]
+
+    _MODEL_CACHE[key] = model
+    return model
 
 
 def scan_images(folder: Path, recursive: bool) -> list[Path]:

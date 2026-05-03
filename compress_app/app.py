@@ -8,10 +8,17 @@ import torch
 
 from compress import compress_folder
 from decompress import decompress_folder
-from utils import MODELS, scan_images, scan_bins
+from utils import (
+    BUILTIN_MODELS,
+    CUSTOM_BASE_MODELS,
+    infer_checkpoint_base,
+    list_custom_checkpoints,
+)
 
 APP_DIR = Path(__file__).parent
 cuda_available = torch.cuda.is_available()
+
+CUSTOM_MODEL_LABEL = "Custom checkpoint (.pth)"
 
 st.set_page_config(page_title="CompressAI", layout="wide")
 st.title("Image Compression")
@@ -69,6 +76,7 @@ def _decompress_df(results: list[dict]) -> pd.DataFrame:
             "Output (KB)":       round(r["out_kb"], 2)  if r.get("out_kb")  is not None else None,
             "Model":             r.get("model"),
             "Quality":           r.get("quality"),
+            "Checkpoint":        r.get("checkpoint"),
             "Status":            r.get("status"),
         }
         for r in results
@@ -88,6 +96,11 @@ def _compress_summary(results: list[dict], show_metrics: bool, elapsed: float) -
     st.markdown("---")
     st.subheader("Summary")
 
+    comp_times   = [r["comp_time"]   for r in results if r.get("comp_time")   is not None]
+    decomp_times = [r["decomp_time"] for r in results if r.get("decomp_time") is not None]
+    avg_comp_s   = sum(comp_times)   / len(comp_times)   if comp_times   else None
+    avg_decomp_s = sum(decomp_times) / len(decomp_times) if decomp_times else None
+
     card1, card2 = st.columns(2)
 
     with card1:
@@ -99,6 +112,9 @@ def _compress_summary(results: list[dict], show_metrics: bool, elapsed: float) -
             r2 = st.columns(2)
             r2[0].metric("Total Time", f"{elapsed:.1f}s")
             r2[1].metric("Avg per Image", f"{avg_s:.2f}s")
+            r3 = st.columns(2)
+            r3[0].metric("Avg Compress", f"{avg_comp_s:.2f}s" if avg_comp_s is not None else "—")
+            r3[1].metric("Avg Decompress", f"{avg_decomp_s:.2f}s" if avg_decomp_s is not None else "—")
 
     with card2:
         with st.container(border=True):
@@ -145,6 +161,8 @@ def _decompress_summary(results: list[dict], elapsed: float) -> None:
     total_in = sum(r.get("comp_kb") or 0 for r in results) / 1024
     total_out = sum(r.get("out_kb") or 0 for r in results if r.get("out_kb")) / 1024
     avg_s = elapsed / ok if ok > 0 else 0.0
+    decomp_times = [r["decomp_time"] for r in results if r.get("decomp_time") is not None]
+    avg_decomp_s = sum(decomp_times) / len(decomp_times) if decomp_times else None
 
     st.markdown("---")
     st.subheader("Summary")
@@ -160,6 +178,9 @@ def _decompress_summary(results: list[dict], elapsed: float) -> None:
             r2 = st.columns(2)
             r2[0].metric("Total Time", f"{elapsed:.1f}s")
             r2[1].metric("Avg per File", f"{avg_s:.2f}s")
+            r3 = st.columns(2)
+            r3[0].metric("Avg Decompress", f"{avg_decomp_s:.2f}s" if avg_decomp_s is not None else "—")
+            r3[1].write("")
 
     with card2:
         with st.container(border=True):
@@ -178,9 +199,17 @@ compress_tab, decompress_tab = st.tabs(["Compress", "Decompress"])
 
 # ── Compress Tab ──────────────────────────────────────────────────────────────
 with compress_tab:
+    checkpoint_path = None
+    checkpoint_quality = None
+    checkpoint_base = None
+
     cfg, _ = st.columns([1, 2])
     with cfg:
-        model_name = st.selectbox("Model", MODELS, key="c_model")
+        model_choice = st.selectbox(
+            "Model",
+            BUILTIN_MODELS + [CUSTOM_MODEL_LABEL],
+            key="c_model",
+        )
         quality = st.slider("Quality", 1, 8, 4, key="c_quality")
         device_opts = ["CPU"] + (["CUDA"] if cuda_available else [])
         device_label = st.radio(
@@ -193,6 +222,81 @@ with compress_tab:
         recursive = st.toggle("Recursive scan", value=True, key="c_recursive")
         metrics = st.toggle("Compute metrics (PSNR / MS-SSIM)", value=False, key="c_metrics")
         delete_source = st.toggle("Delete source files", value=False, key="c_delete")
+
+        if model_choice == CUSTOM_MODEL_LABEL:
+            checkpoints = list_custom_checkpoints(APP_DIR)
+            if not checkpoints:
+                st.warning("No .pth checkpoints found in compress_app.")
+            else:
+                labels = [c["label"] for c in checkpoints]
+                selected_label = st.selectbox(
+                    "Checkpoint (.pth)",
+                    labels,
+                    key="c_checkpoint",
+                )
+                selected = checkpoints[labels.index(selected_label)]
+                checkpoint_path = selected["path"]
+                checkpoint_quality = selected["quality"]
+                if selected.get("teacher"):
+                    st.caption(f"Distilled from: {selected['teacher']}")
+                if checkpoint_quality is not None:
+                    st.caption(
+                        f"Checkpoint quality: q{checkpoint_quality} (slider ignored)."
+                    )
+                base_default = (
+                    selected["student"]
+                    if selected["student"] in CUSTOM_BASE_MODELS
+                    else "tiny-hyperprior"
+                )
+                detected = infer_checkpoint_base(checkpoint_path)
+                detected_base = detected.get("base")
+                detected_matches = detected.get("matches") or []
+                if detected.get("n") is not None and detected.get("m") is not None:
+                    st.caption(
+                        f"Detected channels: N={detected['n']}, M={detected['m']}"
+                    )
+
+                if detected_base:
+                    st.caption(f"Detected base model: {detected_base}")
+                    override = st.toggle(
+                        "Override detected base model",
+                        value=False,
+                        key="c_override_base",
+                    )
+                    if override:
+                        checkpoint_base = st.selectbox(
+                            "Checkpoint base model",
+                            CUSTOM_BASE_MODELS,
+                            index=CUSTOM_BASE_MODELS.index(detected_base),
+                            key="c_custom_base",
+                        )
+                    else:
+                        checkpoint_base = detected_base
+                else:
+                    if detected_matches:
+                        base_default = detected_matches[0]
+                        st.warning(
+                            "Multiple base models match this checkpoint. "
+                            "Please choose one."
+                        )
+                    else:
+                        st.warning(
+                            "Could not detect a base model from the checkpoint. "
+                            "Please choose one."
+                        )
+                    checkpoint_base = st.selectbox(
+                        "Checkpoint base model",
+                        CUSTOM_BASE_MODELS,
+                        index=CUSTOM_BASE_MODELS.index(base_default),
+                        key="c_custom_base",
+                    )
+
+    if model_choice == CUSTOM_MODEL_LABEL:
+        model_name = checkpoint_base or "tiny-hyperprior"
+        model_quality = checkpoint_quality if checkpoint_quality is not None else quality
+    else:
+        model_name = model_choice
+        model_quality = quality
 
     if delete_source:
         st.error(
@@ -218,14 +322,23 @@ with compress_tab:
         errors = []
         if not input_path or not input_path.is_dir():
             errors.append("Please select a valid input folder.")
+        if model_choice == CUSTOM_MODEL_LABEL and not checkpoint_path:
+            errors.append("Please select a .pth checkpoint.")
 
         for e in errors:
             st.error(e)
 
         if not errors:
             total, gen = compress_folder(
-                input_path, output_path, model_name, quality,
-                device, recursive, metrics, delete_source,
+                input_path,
+                output_path,
+                model_name,
+                model_quality,
+                device,
+                recursive,
+                metrics,
+                delete_source,
+                checkpoint_path=checkpoint_path,
             )
 
             if total == 0:

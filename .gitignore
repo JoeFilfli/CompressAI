@@ -10,6 +10,9 @@ compressai/version.py
 tags
 venv*/
 venv/
+compress_app/test_images2/
+compress_app/test_images/
+FYP_Report_2/
 
 # Created by gitignore.io
 ### Python ###
