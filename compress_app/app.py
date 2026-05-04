@@ -34,6 +34,18 @@ def _pick_folder(session_key: str, initial: Path) -> None:
             'return chosen'
         )
         result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    elif sys.platform == "win32":
+        ps_script = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$f = New-Object System.Windows.Forms.FolderBrowserDialog;"
+            f'$f.SelectedPath = "{initial}";'
+            "$f.ShowDialog() | Out-Null;"
+            "Write-Output $f.SelectedPath"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True,
+        )
     else:
         result = subprocess.run(
             ["zenity", "--file-selection", "--directory",
