@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -26,12 +27,20 @@ st.title("Image Compression")
 # ── Folder picker ─────────────────────────────────────────────────────────────
 
 def _pick_folder(session_key: str, initial: Path) -> None:
-    result = subprocess.run(
-        ["zenity", "--file-selection", "--directory",
-         "--title", "Select Folder",
-         "--filename", str(initial) + "/"],
-        capture_output=True, text=True,
-    )
+    if sys.platform == "darwin":
+        script = (
+            'tell application "System Events" to activate\n'
+            f'set chosen to POSIX path of (choose folder with prompt "Select Folder" default location POSIX file "{initial}")\n'
+            'return chosen'
+        )
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    else:
+        result = subprocess.run(
+            ["zenity", "--file-selection", "--directory",
+             "--title", "Select Folder",
+             "--filename", str(initial) + "/"],
+            capture_output=True, text=True,
+        )
     folder = result.stdout.strip()
     if folder:
         st.session_state[session_key] = folder
