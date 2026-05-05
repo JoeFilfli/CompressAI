@@ -247,7 +247,7 @@ with compress_tab:
         if model_choice == CUSTOM_MODEL_LABEL:
             checkpoints = list_custom_checkpoints(APP_DIR)
             if not checkpoints:
-                st.warning("No .pth checkpoints found in compress_app.")
+                st.warning(f"No .pth checkpoints found in: {APP_DIR}")
             else:
                 labels = [c["label"] for c in checkpoints]
                 selected_label = st.selectbox(
