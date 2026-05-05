@@ -8,7 +8,7 @@ import torch
 
 from utils import crop_to_original, load_model, save_jpeg, scan_bins
 
-APP_DIR = Path(__file__).parent
+APP_DIR = Path(__file__).resolve().parent
 
 
 def decompress_folder(
@@ -61,7 +61,8 @@ def decompress_folder(
                             checkpoint_path = local_candidate
                     if checkpoint_path is None:
                         raise FileNotFoundError(
-                            f"Checkpoint not found: {header['checkpoint']}"
+                            f"Checkpoint '{checkpoint_name}' not found. "
+                            f"Place it in the compress_app folder: {APP_DIR}"
                         )
 
                 result["model"] = model_name

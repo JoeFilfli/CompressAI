@@ -16,7 +16,7 @@ from utils import (
     list_custom_checkpoints,
 )
 
-APP_DIR = Path(__file__).parent
+APP_DIR = Path(__file__).resolve().parent
 cuda_available = torch.cuda.is_available()
 
 CUSTOM_MODEL_LABEL = "Custom checkpoint (.pth)"
